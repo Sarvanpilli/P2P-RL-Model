@@ -1,47 +1,48 @@
 # scripts/evaluate_model.py
 """
-Evaluate a saved PPO model across multiple episodes and save metrics.
+Evaluate a saved PPO model across multiple episodes and save metrics + plots.
 
-Usage (PowerShell):
+Example:
 .\myenv\Scripts\python.exe scripts\evaluate_model.py --model models/ppo_p2p.zip --n_episodes 50 --save_dir results --n_agents 6 --episode_len 24
 """
-
 import argparse
 import os
 import sys
 import csv
 import numpy as np
-import matplotlib.pyplot as plt
 
-# Add project root to Python path
+# Add project root to path to allow imports
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from envs.multi_p2p_env import MultiP2PEnergyEnv
 
 def evaluate(model_path, n_episodes, save_dir, n_agents, episode_len, deterministic=True):
     os.makedirs(save_dir, exist_ok=True)
     model = PPO.load(model_path)
-    env = MultiP2PEnergyEnv(n_agents=n_agents, episode_len=episode_len, seed=0)
     results = []
     for ep in range(n_episodes):
-        obs, _ = env.reset()
+        env = MultiP2PEnergyEnv(n_agents=n_agents, episode_len=episode_len, seed=ep)
+        obs, info = env.reset()
         ep_rewards = []
         ep_profits = np.zeros(n_agents)
         ep_emissions = np.zeros(n_agents)
         ep_ginis = []
         t = 0
-        done = False
-        while not done:
+        terminated = False
+        truncated = False
+        while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            ep_rewards.append(reward)  # reward is now scalar (sum of all agents)
-            # capture info fields if present
-            profits = info.get('profits') if 'profits' in info else None
-            emissions = info.get('emissions') if 'emissions' in info else None
-            gini = info.get('gini') if 'gini' in info else None
+            ep_rewards.append(float(reward))
+            profits = info.get('profits')
+            emissions = info.get('emissions')
+            gini = info.get('gini')
             if profits is not None:
                 ep_profits += np.array(profits)
             if emissions is not None:
@@ -54,13 +55,13 @@ def evaluate(model_path, n_episodes, save_dir, n_agents, episode_len, determinis
         results.append({
             'episode': ep,
             'total_reward': float(np.sum(ep_rewards)),
-            'mean_step_reward': float(np.mean(ep_rewards)),
+            'mean_step_reward': float(np.mean(ep_rewards)) if ep_rewards else 0.0,
             'total_profit_sum': float(np.sum(ep_profits)),
             'mean_profit_per_agent': float(np.mean(ep_profits)),
             'total_emissions': float(np.sum(ep_emissions)),
             'mean_gini': float(np.mean(ep_ginis)) if ep_ginis else None
         })
-        print(f"Ep {ep}: total_reward={results[-1]['total_reward']:.4f}, profit_sum={results[-1]['total_profit_sum']:.4f}, mean_gini={results[-1]['mean_gini']:.4f}")
+        print(f"Ep {ep}: total_reward={results[-1]['total_reward']:.4f}, profit_sum={results[-1]['total_profit_sum']:.4f}, mean_gini={results[-1]['mean_gini']}")
 
     # save CSV
     csv_path = os.path.join(save_dir, 'evaluation.csv')
