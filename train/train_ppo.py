@@ -50,7 +50,7 @@ def quick_eval(model_path, n_eval_episodes, n_agents, episode_len, deterministic
     for ep in range(n_eval_episodes):
         obs, info = env.reset()
         terminated = False
-        truncated = False
+        truncated = False 
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=deterministic)
             obs, reward, terminated, truncated, info = env.step(action)
