@@ -1,117 +1,143 @@
 # debug_eval_verbose.py
+# Robust loader: reads saved obs & action spaces from model zip (or PPO.load fallback),
+# builds a matching EnergyMarketEnv and runs a verbose unnormalized evaluation.
+
 import os
+import zipfile
+import pickle
 import numpy as np
-from pathlib import Path
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv
 from energy_env_improved import EnergyMarketEnv
 
-# Get the parent directory (project root) and use models/ from there
-project_root = Path(__file__).parent.parent
-models_dir = project_root / "models"
+# Path to your saved model zip
+MODEL_PATH = r"F:\Projects\P2P-RL-Model\models\ppo_energy_continued_parallel.zip"
 
-MODEL_PATH = models_dir / "ppo_energy_continued.zip"
-VECSTAT = models_dir / "vec_normalize.pkl"
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model not found at: {MODEL_PATH}")
 
-# Try to load model, fallback to checkpoint if continued model doesn't exist
-if not MODEL_PATH.exists():
-    checkpoint_files = list(models_dir.glob("ppo_energy_checkpoint_*_steps.zip"))
-    if checkpoint_files:
-        checkpoint_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        MODEL_PATH = checkpoint_files[0]
-        print(f"Continued model not found, using checkpoint: {MODEL_PATH.name}")
-    else:
-        raise FileNotFoundError(f"No model files found in {models_dir}")
+print("Inspecting model file:", MODEL_PATH)
 
-# Load model first to inspect its observation space
-print("Inspecting saved model to determine environment configuration...")
+saved_obs_space = None
+saved_act_space = None
+
+# Try reading data.pkl inside the zip (preferred)
 try:
-    temp_model = PPO.load(str(MODEL_PATH), print_system_info=False)
-    saved_obs_space = temp_model.observation_space
-    obs_size = saved_obs_space.shape[0]
-    print(f"Saved model observation space: {saved_obs_space.shape}")
+    with zipfile.ZipFile(MODEL_PATH, "r") as archive:
+        if "data.pkl" in archive.namelist():
+            with archive.open("data.pkl", "r") as f:
+                data = pickle.load(f)
+                saved_obs_space = data.get("observation_space", None)
+                saved_act_space = data.get("action_space", None)
+                print("Found data.pkl inside zip and extracted spaces.")
+        else:
+            print("data.pkl not found inside zip; will try PPO.load fallback.")
 except Exception as e:
-    print(f"Warning: Could not inspect model ({e}), assuming 20 dimensions (forecast_horizon=0)")
-    obs_size = 20
+    print("Error reading zip/data.pkl:", e)
 
-# Calculate what forecast_horizon was used based on observation space
-# obs_size = n_agents * (5 + 2*forecast_horizon)
-# So: forecast_horizon = (obs_size / n_agents - 5) / 2
-N_AGENTS = 4
-forecast_horizon = int((obs_size / N_AGENTS - 5) / 2)
+# Fallback: use PPO.load to extract spaces if necessary
+if saved_obs_space is None or saved_act_space is None:
+    try:
+        tmp = PPO.load(MODEL_PATH, print_system_info=False)
+        saved_obs_space = getattr(tmp, "observation_space", saved_obs_space)
+        saved_act_space = getattr(tmp, "action_space", saved_act_space)
+        print("Extracted spaces via PPO.load fallback.")
+    except Exception as e:
+        print("PPO.load fallback failed:", e)
+
+if saved_obs_space is None or saved_act_space is None:
+    raise RuntimeError("Could not determine saved observation/action spaces from model.")
+
+print("Saved observation space shape:", saved_obs_space.shape)
+print("Saved action space shape:", saved_act_space.shape)
+
+# Infer per-agent layout and forecast horizon
+obs_size = int(np.prod(saved_obs_space.shape))
+N_AGENTS = 4  # adjust if your model used different number of agents
+per_agent_len = obs_size // N_AGENTS
+if per_agent_len * N_AGENTS != obs_size:
+    raise ValueError("Saved obs_size not divisible by N_AGENTS; adjust N_AGENTS or inspect saved model.")
+
+forecast_horizon = int((per_agent_len - 5) / 2)
 if forecast_horizon < 0:
     forecast_horizon = 0
-print(f"Inferred forecast_horizon: {forecast_horizon} (for {N_AGENTS} agents, obs_size={obs_size})")
 
-def make_vec(forecast_horizon=0):
-    return DummyVecEnv([lambda: EnergyMarketEnv(n_agents=N_AGENTS, 
-                                                max_line_capacity_kw=200.0,
-                                                per_agent_max_kw=120.0, 
-                                                base_price=0.12,
-                                                price_slope=0.002, 
-                                                overload_multiplier=25.0,
-                                                forecast_horizon=forecast_horizon)])
+print(f"Inferred per-agent length: {per_agent_len}, forecast_horizon: {forecast_horizon}")
 
-vec = make_vec(forecast_horizon=forecast_horizon)
+# Infer battery_capacity_kwh from saved_obs_space.high if available (soc index = 1)
+battery_capacity_guess = None
+try:
+    high = np.array(saved_obs_space.high).reshape(-1)
+    per_high = high.reshape(N_AGENTS, per_agent_len)
+    soc_high = float(per_high[0, 1])
+    if np.isfinite(soc_high) and 0 < soc_high < 1e6:
+        battery_capacity_guess = soc_high
+        print("Inferred battery_capacity_kwh from obs_high:", battery_capacity_guess)
+except Exception:
+    battery_capacity_guess = None
 
-# Try to load VecNormalize stats with error handling
-if VECSTAT.exists():
-    try:
-        vec = VecNormalize.load(str(VECSTAT), vec)
-        vec.training = False
-        vec.norm_reward = False
-        print("Successfully loaded VecNormalize stats.")
-    except (AssertionError, ValueError) as e:
-        print(f"Warning: Could not load VecNormalize stats (shape mismatch: {e})")
-        print("Running without normalization.")
-else:
-    print("VecNormalize not found, running unnormalized.")
+if battery_capacity_guess is None:
+    battery_capacity_guess = 50.0
+    print("Falling back to default battery_capacity_kwh =", battery_capacity_guess)
 
-# Load model with matching environment
-model = PPO.load(str(MODEL_PATH), env=vec)
+# Infer battery_max_charge_kw and per_agent_max_kw from saved action_space.high
+act_high = np.array(saved_act_space.high).reshape(-1)
+try:
+    per_act_len = act_high.shape[0] // N_AGENTS
+    per_act = act_high.reshape(N_AGENTS, per_act_len)
+    battery_max_charge_guess = float(per_act[0, 0])
+    per_agent_max_kw_guess = float(per_act[0, 1])
+    print("Inferred battery_max_charge_kw:", battery_max_charge_guess,
+          "per_agent_max_kw:", per_agent_max_kw_guess)
+except Exception as e:
+    battery_max_charge_guess = 25.0
+    per_agent_max_kw_guess = 120.0
+    print("Could not infer action highs, using defaults (25,120). Error:", e)
 
-# VecEnv.reset() returns only observation, not (obs, info) tuple
-obs = vec.reset()
-action, _ = None, None
+# Build environment matching saved spaces
+def make_env():
+    return EnergyMarketEnv(
+        n_agents=N_AGENTS,
+        forecast_horizon=forecast_horizon,
+        battery_capacity_kwh=battery_capacity_guess,
+        battery_max_charge_kw=battery_max_charge_guess,
+        per_agent_max_kw=per_agent_max_kw_guess,
+        shaping_coef=float(os.environ.get("SHAPING_COEF", "1.0")),
+        seed=999
+    )
 
-# run a single episode and print verbose info
-for t in range(120):
+env = DummyVecEnv([make_env])
+
+print("Created env with matching spaces. Now loading model with env...")
+
+# Load model with env (this validates spaces match)
+model = PPO.load(MODEL_PATH, env=env)
+print("Model loaded successfully.")
+
+# Verbose evaluation
+obs = env.reset()  # DummyVecEnv.reset() returns observation only
+real_env = env.envs[0]
+per_len_local = real_env.observation_space.shape[0] // real_env.n_agents
+
+for t in range(240):
     action, _ = model.predict(obs, deterministic=True)
-    obs, rewards, dones, infos = vec.step(action)
-    # VecEnv returns dones (not terminated/truncated separately)
-    terminated = bool(dones[0]) if hasattr(dones, "__len__") else bool(dones)
-    truncated = False  # VecEnv doesn't distinguish terminated/truncated
-    info = infos[0] if isinstance(infos, list) else infos
-    # rewards may be array or scalar
-    r = float(np.array(rewards).reshape(-1)[0]) if hasattr(rewards, "__len__") else float(rewards)
-    # info may be dict or list
-    ginfo = info if isinstance(info, dict) else info[0]
-    # extract per-agent diagnostics if present
-    intended = ginfo.get("intended_injection_kw")
-    curtail = ginfo.get("curtailment_kw")
-    soc = None
-    pv = None
-    # try to extract soc and pv from observation (obs flattened)
-    flat = np.array(obs).reshape(-1)
-    # obs layout per agent: [demand,soc,pv, total_export,total_import, pv_f1.., dem_f1..]
-    per_len = (len(flat) // 4)  # attempt to infer per-agent length (fallback)
-    n_agents = 4
-    per_len = len(flat) // n_agents
-    per = flat.reshape(n_agents, per_len)
-    try:
-        soc = per[:,1]
-        pv = per[:,2]
-    except Exception:
-        soc = np.zeros(n_agents)
-        pv = np.zeros(n_agents)
+    obs, rewards, dones, infos = env.step(action)
 
-    print(f"\nStep {t}  global_price={ginfo.get('market_price'):.4f} line_ol={ginfo.get('line_overload_kw'):.4f} total_reward={r:.3f}")
-    for i in range(n_agents):
-        a_batt = action.reshape(n_agents,2)[i,0]
-        a_grid = action.reshape(n_agents,2)[i,1]
-        intended_i = float(intended[i]) if intended is not None else None
-        curtail_i = float(curtail[i]) if curtail is not None else 0.0
-        print(f" A{i}: action=[batt {a_batt:.2f}, grid {a_grid:.2f}] soc={soc[i]:.2f} pv={pv[i]:.2f} intended={intended_i} curtail={curtail_i}")
-    if terminated or truncated:
-        print("Episode ended")
+    # rewards is vector-like; get scalar for first env
+    reward = float(np.array(rewards).reshape(-1)[0])
+    env_info = infos[0] if isinstance(infos, (list, tuple)) else infos
+
+    flat = np.array(obs).reshape(-1)
+    per = flat.reshape(real_env.n_agents, per_len_local)
+
+    print(f"\nStep {t}  price={env_info.get('market_price'):.4f} line_ol={env_info.get('line_overload_kw'):.4f} total_reward={reward:.3f}")
+    for i in range(real_env.n_agents):
+        a_batt = action.reshape(real_env.n_agents, 2)[i, 0]
+        a_grid = action.reshape(real_env.n_agents, 2)[i, 1]
+        intended = float(env_info.get("intended_injection_kw")[i]) if env_info.get("intended_injection_kw") is not None else 0.0
+        curtail = float(env_info.get("curtailment_kw")[i]) if env_info.get("curtailment_kw") is not None else 0.0
+        print(f" A{i}: action=[batt {a_batt:.2f}, grid {a_grid:.2f}] soc={per[i,1]:.2f} pv={per[i,2]:.2f} intended={intended:.2f} curtail={curtail:.2f}")
+
+    if dones[0]:
+        print("Episode ended at step", t)
         break

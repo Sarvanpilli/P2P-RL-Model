@@ -1,10 +1,12 @@
 # energy_env_improved.py
-# Patched environment: stronger price sensitivity & overload penalty + 3-step naive forecast in obs
-# Includes temporary reward-shaping scaffolds to accelerate learning:
-#  - small bonus when total imports decrease vs previous step
-#  - small bonus for exporting when market price > base_price
-#
-# Remove or anneal the shaping (set shaping_coef -> 0) once the policy reliably reduces imports/exports.
+# Environment for multi-agent P2P energy RL (centralized policy).
+# Key updates:
+# - Larger battery defaults (capacity/power)
+# - Higher initial SOC
+# - import cost multiplier (temporary shaping)
+# - shaping_coef passed via kwargs and applied to shaping bonuses
+# - robust handling for forecast_horizon == 0
+# - returns scalar reward (sum of per-agent rewards) for SB3
 
 import numpy as np
 import gymnasium as gym
@@ -27,21 +29,25 @@ class EnergyMarketEnv(gym.Env):
                  per_agent_max_kw=200.0,
                  alpha_loss=1e-4,
                  beta_loss=1e-6,
-                 battery_capacity_kwh=50.0,
-                 battery_max_charge_kw=25.0,
+                 battery_capacity_kwh=150.0,     # increased default
+                 battery_max_charge_kw=80.0,     # increased default
                  battery_roundtrip_eff=0.95,
                  battery_deg_k_throughput=0.02,
                  battery_deg_k_dod=0.5,
                  base_price=0.12,
-                 price_slope=0.01,             # increased sensitivity
-                 overload_multiplier=50.0,     # stronger overload penalty
-                 forecast_horizon=3,           # 3-step naive forecast
+                 price_slope=0.01,
+                 overload_multiplier=50.0,
+                 forecast_horizon=3,
+                 import_cost_multiplier=1.6,     # temporary extra import penalty
                  seed=None,
                  **kwargs):
         super().__init__()
 
-        # shaping coefficient (controls strength of reward bonuses; set via kwargs or env ctor)
+        # shaping coefficient (controls strength of reward bonuses; pass shaping_coef via kwargs)
         self.shaping_coef = float(kwargs.get("shaping_coef", 1.0))
+
+        # import cost multiplier (temporary): multiplies cost of imports (negative exchanged_kwh)
+        self.import_cost_multiplier = float(import_cost_multiplier)
 
         self.n_agents = int(n_agents)
         self.timestep_hours = float(timestep_hours)
@@ -91,8 +97,9 @@ class EnergyMarketEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         demands = self.rng.uniform(0.0, 50.0, size=(self.n_agents,))
-        soc = self.rng.uniform(0.2 * self.battery_capacity_kwh,
-                               0.8 * self.battery_capacity_kwh,
+        # higher initial SOC for diagnostic/training speed
+        soc = self.rng.uniform(0.7 * self.battery_capacity_kwh,
+                               0.95 * self.battery_capacity_kwh,
                                size=(self.n_agents,))
         pv = self.rng.uniform(0.0, 40.0, size=(self.n_agents,))
         self.state[:, 0] = demands
@@ -107,9 +114,6 @@ class EnergyMarketEnv(gym.Env):
         return self._get_obs(), {}
 
     def _naive_forecast(self, array, h):
-        # Robust naive forecast:
-        # - If h <= 0, return an empty array shaped (n_agents, 0)
-        # - Otherwise return stacked forecasts (n_agents, h)
         n = array.shape[0]
         if h <= 0:
             return np.zeros((n, 0), dtype=np.float32)
@@ -117,11 +121,11 @@ class EnergyMarketEnv(gym.Env):
         for step in range(1, h+1):
             factor = 1.0 + 0.02 * step
             forecasts.append(array * factor)
-        return np.stack(forecasts, axis=1)  # shape (n_agents, h)
+        return np.stack(forecasts, axis=1)
 
     def _get_obs(self, total_export=0.0, total_import=0.0):
         h = self.forecast_horizon
-        pv_fore = self._naive_forecast(self.state[:,2], h)  # (n_agents, h) or (n_agents,0)
+        pv_fore = self._naive_forecast(self.state[:,2], h)
         dem_fore = self._naive_forecast(self.state[:,0], h)
         per_agent = np.zeros((self.n_agents, 3 + 2 + h + h), dtype=np.float32)
         per_agent[:, 0:3] = self.state
@@ -234,18 +238,15 @@ class EnergyMarketEnv(gym.Env):
         # -----------------------------
         # Temporary shaping (start)
         # -----------------------------
-        # initialize prev_total_import_kw if None
         if not hasattr(self, "prev_total_import_kw") or self.prev_total_import_kw is None:
             self.prev_total_import_kw = total_import_kw_after
 
         import_reduction_kw = float(self.prev_total_import_kw - total_import_kw_after)
         if import_reduction_kw > 0:
-            # small total $ bonus for reduction (team-level) scaled by shaping_coef
             import_reduction_bonus_total = self.shaping_coef * 0.05 * import_reduction_kw
         else:
             import_reduction_bonus_total = 0.0
 
-        # export bonus per agent when exporting at price > base_price
         export_bonus_total_per_agent = np.zeros(self.n_agents, dtype=float)
         for i in range(self.n_agents):
             exchanged_kwh = effective_grid_injection_kw[i] * energy_hours
@@ -254,7 +255,6 @@ class EnergyMarketEnv(gym.Env):
             else:
                 export_bonus_total_per_agent[i] = 0.0
 
-        # update prev for next step
         self.prev_total_import_kw = total_import_kw_after
         # -----------------------------
         # Temporary shaping (end)
@@ -263,7 +263,12 @@ class EnergyMarketEnv(gym.Env):
         rewards = np.zeros(self.n_agents, dtype=float)
         for i in range(self.n_agents):
             exchanged_kwh = effective_grid_injection_kw[i] * energy_hours
-            rewards[i] += exchanged_kwh * market_price
+            # if importing (exchanged_kwh < 0) apply stronger cost multiplier (temporary)
+            if exchanged_kwh < 0:
+                rewards[i] += exchanged_kwh * market_price * self.import_cost_multiplier
+            else:
+                rewards[i] += exchanged_kwh * market_price
+
             if curtailment[i] > 0:
                 rewards[i] -= curtailment[i] * energy_hours * market_price
             if line_overload_kw > 0:
@@ -272,12 +277,10 @@ class EnergyMarketEnv(gym.Env):
                 rewards[i] -= contribution * self.overload_multiplier * (1.0 + 0.01 * line_overload_kw)
             rewards[i] -= batt_deg_costs[i]
 
-            # apply temporary shaping bonuses
             if import_reduction_bonus_total > 0:
                 rewards[i] += (import_reduction_bonus_total / float(self.n_agents))
             rewards[i] += export_bonus_total_per_agent[i]
 
-        # update state: small random walk for demand & PV, SOC already updated above
         self.state[:, 0] = np.clip(self.state[:, 0] + self.rng.normal(0, 1.0, size=self.n_agents), 0.0, 500.0)
         self.state[:, 1] = soc
         self.state[:, 2] = np.clip(self.state[:, 2] + self.rng.normal(0, 2.0, size=self.n_agents), 0.0, 200.0)
@@ -303,7 +306,6 @@ class EnergyMarketEnv(gym.Env):
         obs = self._get_obs(total_export=total_export_kw, total_import=total_import_kw)
         terminated = False
         truncated = False
-        # Return scalar reward (sum of all agent rewards) for centralized policy
         total_reward = float(np.sum(rewards))
         return obs, total_reward, terminated, truncated, info
 

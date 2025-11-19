@@ -1,74 +1,68 @@
 # resume_parallel.py
 import os
 import glob
+import platform
+import multiprocessing as mp
 import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from energy_env_improved import EnergyMarketEnv
 
-def make_env(seed_offset=0, n_agents=4, seed=123, forecast_horizon=0):
+def make_env(seed_offset=0, n_agents=4, seed=123, forecast_horizon=0, shaping_coef=1.0,
+             battery_capacity_kwh=150.0, battery_max_charge_kw=80.0):
     def _init():
         env = EnergyMarketEnv(n_agents=n_agents,
                               max_line_capacity_kw=200.0,
                               per_agent_max_kw=120.0,
                               base_price=0.12,
-                              price_slope=0.002,  # Match original training parameters
-                              overload_multiplier=25.0,  # Match original training parameters
+                              price_slope=0.002,
+                              overload_multiplier=25.0,
                               forecast_horizon=forecast_horizon,
-                              seed=seed + seed_offset)
+                              seed=seed + seed_offset,
+                              shaping_coef=shaping_coef,
+                              battery_capacity_kwh=battery_capacity_kwh,
+                              battery_max_charge_kw=battery_max_charge_kw)
         return Monitor(env)
     return _init
 
 if __name__ == '__main__':
-    # Get the parent directory (project root) and use models/ from there
-    MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-    MODEL_DIR = os.path.abspath(MODEL_DIR)  # Normalize the path
+    PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # find latest checkpoint (look for ppo_energy_checkpoint_*.zip or ppo_energy_continued.zip)
     candidates = glob.glob(os.path.join(MODEL_DIR, "ppo_energy_checkpoint_*.zip")) + \
                  glob.glob(os.path.join(MODEL_DIR, "ppo_energy_continued*.zip")) + \
                  glob.glob(os.path.join(MODEL_DIR, "ppo_energy_*.zip"))
     if not candidates:
         raise FileNotFoundError("No checkpoint found in models/. Run initial training first.")
-    # pick the most recently modified
     checkpoint = max(candidates, key=os.path.getmtime)
     print("Resuming from checkpoint:", checkpoint)
 
-    # Load model first without environment to inspect its observation space
     print("Inspecting saved model to determine environment configuration...")
+    obs_size = None
     try:
-        # Try loading without env to get observation space info
-        import zipfile
-        import pickle
+        import zipfile, pickle
         with zipfile.ZipFile(checkpoint, 'r') as archive:
-            # Load the data.pkl which contains model metadata
             with archive.open('data.pkl', 'r') as f:
                 data = pickle.load(f)
                 saved_obs_space = data.get('observation_space')
                 if saved_obs_space is not None:
                     obs_size = saved_obs_space.shape[0]
                     print(f"Saved model observation space: {saved_obs_space.shape}")
-                else:
-                    raise ValueError("Could not find observation_space in saved model")
     except Exception as e:
-        print(f"Warning: Could not inspect model file directly ({e}), trying alternative method...")
-        # Fallback: try loading model without env (may fail but we'll catch it)
+        print(f"Warning: quick inspect failed ({e}), falling back to loading model metadata...")
         try:
             temp_model = PPO.load(checkpoint, print_system_info=False)
-            saved_obs_space = temp_model.observation_space
-            obs_size = saved_obs_space.shape[0]
-            print(f"Saved model observation space: {saved_obs_space.shape}")
+            saved_obs_space = getattr(temp_model, "observation_space", None)
+            if saved_obs_space is not None:
+                obs_size = saved_obs_space.shape[0]
+                print(f"Saved model observation space via load: {saved_obs_space.shape}")
         except Exception as e2:
-            # Last resort: assume default based on error message pattern
-            print(f"Could not determine observation space, assuming 20 dimensions (forecast_horizon=0)")
+            print(f"Warning: fallback load failed ({e2}), assuming obs_size=20.")
             obs_size = 20
-    
-    # Calculate what forecast_horizon was used based on observation space
-    # obs_size = n_agents * (5 + 2*forecast_horizon)
-    # So: forecast_horizon = (obs_size / n_agents - 5) / 2
-    N_AGENTS = 4  # Assume 4 agents (can be adjusted if needed)
+
+    N_AGENTS = 4
     forecast_horizon = int((obs_size / N_AGENTS - 5) / 2)
     if forecast_horizon < 0:
         forecast_horizon = 0
@@ -76,23 +70,40 @@ if __name__ == '__main__':
 
     VECSTAT = os.path.join(MODEL_DIR, "vec_normalize.pkl")
 
-    N_PARALLEL = 4
-    SEED = 123
-    CONTINUE_TIMESTEPS = 1_000_000  # change if you want more or less
+    N_PARALLEL = int(os.environ.get("N_PARALLEL", "4"))
+    SEED = int(os.environ.get("SEED", "123"))
+    CONTINUE_TIMESTEPS = int(os.environ.get("CONTINUE_TIMESTEPS", "1000000"))
+    SHAPING_COEF = float(os.environ.get("SHAPING_COEF", "1.0"))
 
-    print(f"Creating SubprocVecEnv with {N_PARALLEL} processes...")
-    env_fns = [make_env(i, n_agents=N_AGENTS, seed=SEED, forecast_horizon=forecast_horizon) 
+    # Windows: ensure 'spawn' start method
+    if platform.system() == "Windows":
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
+    print(f"Creating {N_PARALLEL} env instances (shaping_coef={SHAPING_COEF})...")
+    env_fns = [make_env(i, n_agents=N_AGENTS, seed=SEED, forecast_horizon=forecast_horizon,
+                        shaping_coef=SHAPING_COEF,
+                        battery_capacity_kwh=float(os.environ.get("BATTERY_CAPACITY_KWH", "150.0")),
+                        battery_max_charge_kw=float(os.environ.get("BATTERY_MAX_CHARGE_KW", "80.0")))
                for i in range(N_PARALLEL)]
-    vec_env = SubprocVecEnv(env_fns)
+
+    try:
+        vec_env = SubprocVecEnv(env_fns)
+    except Exception as e:
+        print(f"SubprocVecEnv failed ({e}), falling back to DummyVecEnv (single-process).")
+        vec_env = DummyVecEnv(env_fns)
 
     if os.path.exists(VECSTAT):
         print("Attempting to load VecNormalize stats...")
         try:
             vec_env = VecNormalize.load(VECSTAT, vec_env)
+            vec_env.training = False
+            vec_env.norm_reward = False
             print("Successfully loaded VecNormalize stats.")
-        except (AssertionError, ValueError) as e:
-            print(f"Warning: Could not load VecNormalize stats (shape mismatch or other error: {e})")
-            print("Creating new VecNormalize wrapper...")
+        except (AssertionError, ValueError, EOFError) as e:
+            print(f"Warning: Could not load VecNormalize stats ({e}), creating new VecNormalize wrapper.")
             vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
     else:
         print("No VecNormalize stats found. Creating new VecNormalize wrapper...")
@@ -100,19 +111,17 @@ if __name__ == '__main__':
 
     print("Loading PPO model with matching environment...")
     model = PPO.load(checkpoint, env=vec_env)
-    # ensure model uses new env
     model.set_env(vec_env)
-    # Note: Don't change n_steps after loading - the buffer was created with the original n_steps
-    # If you need to change n_steps, you'd need to recreate the model with the new value
     print(f"Using n_steps={model.n_steps} from saved model")
 
     print("Continuing training for", CONTINUE_TIMESTEPS, "timesteps...")
-    # Use reset_num_timesteps=True to properly initialize the rollout buffer
-    # The learned weights are preserved, only the timestep counter resets
     model.learn(total_timesteps=CONTINUE_TIMESTEPS, reset_num_timesteps=True)
 
     final_path = os.path.join(MODEL_DIR, "ppo_energy_continued_parallel.zip")
     print("Saving model to", final_path)
     model.save(final_path)
-    vec_env.save(os.path.join(MODEL_DIR, "vec_normalize.pkl"))
+    try:
+        vec_env.save(os.path.join(MODEL_DIR, "vec_normalize.pkl"))
+    except Exception as e:
+        print("Warning: VecNormalize save failed:", e)
     print("Done.")
