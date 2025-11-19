@@ -44,6 +44,9 @@ class MultiP2PEnergyEnv(gym.Env):
                                        high=np.array([self.max_power]*self.n, dtype=np.float32),
                                        dtype=np.float32)
 
+        # shaping coefficient (control externally from resume script)
+        self.shaping_coef = float(config.get("shaping_coef", 1.0))  # multiply bonuses by this
+
         # State
         self.t = 0
         self.soc = np.full(self.n, self.battery_capacity * 0.5, dtype=np.float32)
