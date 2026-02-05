@@ -1,9 +1,6 @@
 # scripts/evaluate_model.py
 """
-Evaluate a saved PPO model across multiple episodes and save metrics + plots.
-
-Example:
-.\myenv\Scripts\python.exe scripts\evaluate_model.py --model models/ppo_p2p.zip --n_episodes 50 --save_dir results --n_agents 6 --episode_len 24
+Evaluating a saved PPO model across multiple episodes and saving metrics + plots.
 """
 import argparse
 import os

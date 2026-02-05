@@ -1,0 +1,33 @@
+# Task: Final Requirements Alignment
+
+- [x] **Phase 6: Advanced Pricing & Market Logic** <!-- id: 19 -->
+    - [x] Update `EnergyMarketEnv` Action Space to include `price_bid` <!-- id: 21 -->
+    - [x] Update `MatchingEngine` to support Limit Orders (Quantity + Price) <!-- id: 23 -->
+    - [x] Retrain Model with new Action/State space <!-- id: 26 -->
+    - [x] Run Final Evaluation and Walkthrough <!-- id: 27 -->
+- [x] **Phase 8: Robustness & Validation Overhaul** <!-- id: 28 -->
+    - [x] **Feasibility Filter**: Make deterministic, idempotent, and return `changed` flag <!-- id: 29 -->
+    - [x] **Matching Engine**: Implement Uniform Price Double Auction & Conservation Checks <!-- id: 30 -->
+    - [x] **Environment Physics**: Fix `dt_hours` usage and power balance assertions <!-- id: 31 -->
+    - [x] **Training**: Ensure `VecNormalize` save/load and add Overfit Test <!-- id: 32 -->
+    - [x] Create `evaluation/generate_plots.py` for comprehensive visualization
+- [x] Generate Plot 1: Battery SoC vs Time
+- [x] Generate Plot 2: Grid Import/Export vs Time
+- [x] Generate Plot 3: Market Price vs Hour
+- [x] Generate Plot 4: Cumulative Profit Comparison
+- [ ] Generate Plot 5: Safety Guard Interventions (Skipped: Data not available in logs)
+- [x] **Metrics**: Add automated CSV logging for all key metrics <!-- id: 33 -->
+- [x] **Phase 9: Refactoring & Stabilization** <!-- id: 34 -->
+    - [x] **Cleanup**: Delete disjoint environments (`multi_p2p_env`, `energy_env_improved`) <!-- id: 35 -->
+    - [x] **Physics Extraction**: Create `simulation/microgrid.py` with `MicrogridNode` <!-- id: 36 -->
+    - [x] **Environment Consolidation**: Refactor `EnergyMarketEnvRobust` to use `MicrogridNode` & Data Loading <!-- id: 37 -->
+    - [x] **Pipeline Fix**: Update `train_sb3_ppo.py` and `evaluate_episode.py` to use the consolidated env <!-- id: 38 -->
+- [x] **Phase 10: Live Demo & Visualization** <!-- id: 39 -->
+    - [x] **Dashboard**: Create `dashboard.py` with Streamlit & Plotly <!-- id: 40 -->
+    - [x] **Verification**: Test the dashboard with the trained model <!-- id: 41 -->
+
+- [x] **Phase 11: Large Scale Scaling & Demo** <!-- id: 42 -->
+    - [x] **Core Upgrade**: Add `AgentType` (Prosumer/Consumer) and Dynamic Grid Scaling <!-- id: 43 -->
+    - [x] **Robustness**: Implement Price Bounding, Carbon Logging, and Strict Trained Model Enforcement <!-- id: 44 -->
+    - [x] **Verification**: Validate 125-Agent Scenario (100P + 25C) <!-- id: 45 -->
+    - [x] **Demo App**: Build `demo_app.py` with Live Metrics and PPO-Only logic <!-- id: 46 -->

@@ -3,89 +3,151 @@
 Train a shared PPO policy (Stable-Baselines3) controlling all agents in the
 energy_env_improved.Environment (flattened obs/actions).
 
-Saves a best model to ./models/ppo_energy.zip and logs to ./logs/.
+Features:
+- CLI arguments for seed, timesteps, overfit mode.
+- Saves VecNormalize statistics.
+- Deterministic training option.
+
 Run:
-    python train_sb3_ppo.py
+    python train/train_sb3_ppo.py --timesteps 100000 --seed 42
 """
+import argparse
 import os
+import sys
 import numpy as np
+import torch
+from typing import Callable
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
-import gymnasium as gym
 
-# import your env - handle both running from root and from train directory
+# Add parent directory to path to find 'train' module if running from train/
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 try:
-    from train.energy_env_improved import EnergyMarketEnv
+    from train.energy_env_robust import EnergyMarketEnvRobust
 except ImportError:
-    # If running from train directory, use relative import
-    from energy_env_improved import EnergyMarketEnv
+    from energy_env_robust import EnergyMarketEnvRobust
 
-# ==== CONFIG ====
-ENV_NAME = "EnergyMarket-v0"
-TIMESTEPS = 200_000          # start here; scale up to millions later
-N_AGENTS = 4
-SEED = 42
-MODEL_DIR = "models"
-LOG_DIR = "logs"
-EVAL_EPISODES = 6
-EVAL_FREQ = 10_000
-
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# ==== Environment factory ====
-def make_env():
+def make_env(rank, n_agents=4, n_prosumers=None, n_consumers=None, seed=0, forecast_horizon=1):
     def _init():
-        env = EnergyMarketEnv(n_agents=N_AGENTS,
-                              max_line_capacity_kw=200.0,
-                              per_agent_max_kw=120.0,
-                              base_price=0.12,
-                              price_slope=0.002,
-                              overload_multiplier=25.0,
-                              seed=np.random.randint(0, 2**31 - 1))
-        # wrap with Monitor for SB3 logging
+        # Initialize Robust Env with Data File
+        env = EnergyMarketEnvRobust(
+            n_agents=n_agents,
+            n_prosumers=n_prosumers, # explicit
+            n_consumers=n_consumers, # explicit
+            forecast_horizon=forecast_horizon, 
+            seed=seed + rank,
+            data_file="test_day_profile.csv"
+        )
         env = Monitor(env)
         return env
     return _init
 
-# Create a vectorized environment
-vec_env = DummyVecEnv([make_env() for _ in range(1)])  # you can increase to multiple env copies
-# Normalize observations and rewards (recommended for PPO)
-vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+def linear_schedule(initial_value: float) -> Callable[[float], float]:
+    """
+    Linear learning rate schedule.
+    :param initial_value: Initial learning rate.
+    :return: schedule that computes current learning rate depending on remaining progress
+    """
+    def func(progress_remaining: float) -> float:
+        """
+        Progress remaining lies between 1.0 and 0.0.
+        """
+        return progress_remaining * initial_value
+    return func
 
-# Policy architecture: small MLP to handle flattened obs/actions
-policy_kwargs = dict(net_arch=dict(pi=[512, 256], vf=[512, 256]))
+def main():
 
-# Callbacks: checkpoint + eval
-checkpoint_callback = CheckpointCallback(save_freq=50_00, save_path=MODEL_DIR,
-                                         name_prefix="ppo_energy_checkpoint")
-# Use EvalCallback to evaluate on separate envs
-eval_env = DummyVecEnv([make_env() for _ in range(1)])
-eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-eval_callback = EvalCallback(eval_env, best_model_save_path=MODEL_DIR,
-                             log_path=LOG_DIR, eval_freq=EVAL_FREQ,
-                             n_eval_episodes=EVAL_EPISODES, deterministic=True, render=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--n_agents", type=int, default=4, help="Total Agents (Deprecated, use P+C)")
+    parser.add_argument("--n_prosumers", type=int, default=None, help="Number of Prosumers")
+    parser.add_argument("--n_consumers", type=int, default=None, help="Number of Consumers")
+    parser.add_argument("--timesteps", type=int, default=100000, help="Total training timesteps")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--overfit", action="store_true", help="Run in overfit mode (deterministic env)")
+    parser.add_argument("--model_dir", type=str, default="models", help="Directory to save models")
+    parser.add_argument("--log_dir", type=str, default="logs", help="Directory for tensorboard logs")
+    args = parser.parse_args()
 
-# ==== Create model ====
-model = PPO("MlpPolicy",
-            vec_env,
-            verbose=1,
-            seed=SEED,
-            batch_size=2048,
-            n_steps=2048,
-            learning_rate=3e-4,
-            ent_coef=0.001,
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=LOG_DIR)
+    # Set seeds
+    seed = args.seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-# ==== Start training ====
-print("Starting training for", TIMESTEPS, "timesteps...")
-model.learn(total_timesteps=TIMESTEPS, callback=[checkpoint_callback, eval_callback])
+    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.model_dir, exist_ok=True)
 
-# Save final model (and the VecNormalize stats)
-model.save(os.path.join(MODEL_DIR, "ppo_energy_final"))
-vec_env.save(os.path.join(MODEL_DIR, "vec_normalize.pkl"))
+    # Environment Setup
+    # Resolve Agent Counts
+    if args.n_prosumers is not None and args.n_consumers is not None:
+        total_agents = args.n_prosumers + args.n_consumers
+        n_p = args.n_prosumers
+        n_c = args.n_consumers
+    else:
+        total_agents = args.n_agents
+        n_p = None
+        n_c = None
 
-print("Training completed. Models saved in", MODEL_DIR)
+    if args.overfit:
+        print(f"--- OVERFIT MODE: Deterministic Environment (Seed {seed}) ---")
+        env = make_env(0, n_agents=total_agents, n_prosumers=n_p, n_consumers=n_c, seed=seed)()
+        env = Monitor(env)
+        env = DummyVecEnv([lambda: env])
+    else:
+        # Vectorized Environment
+        num_cpu = 4
+        print(f"--- NORMAL MODE: {num_cpu} Parallel Environments (Agents: {total_agents}) ---")
+        env = DummyVecEnv([make_env(i, n_agents=total_agents, n_prosumers=n_p, n_consumers=n_c, seed=seed) for i in range(num_cpu)])
+
+    # Normalize Observations and Rewards
+    # Critical for PPO stability
+    # We save this wrapper's stats later
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10.)
+
+    # Model Setup - Optimized for Performance
+    # Larger Net: [400, 300]
+    # Higher Entropy: 0.01 (Exploration)
+    # Larger Batch: 256
+    policy_kwargs = dict(net_arch=dict(pi=[400, 300], vf=[400, 300]))
+    
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        tensorboard_log=args.log_dir,
+        learning_rate=linear_schedule(3e-4), # Decay to 0
+        n_steps=4096,   # Longer horizon
+        batch_size=256, # Stable gradients
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01, # Force exploration
+        seed=seed,
+        policy_kwargs=policy_kwargs
+    )
+
+    # Callbacks
+    checkpoint_callback = CheckpointCallback(
+        save_freq=10000,
+        save_path=args.model_dir,
+        name_prefix="ppo_energy"
+    )
+
+    print(f"Starting training for {args.timesteps} timesteps...")
+    model.learn(total_timesteps=args.timesteps, callback=checkpoint_callback)
+
+    # Save Final Model
+    final_path = os.path.join(args.model_dir, "ppo_energy_final")
+    model.save(final_path)
+    
+    # Save VecNormalize Stats
+    stats_path = os.path.join(args.model_dir, "vec_normalize.pkl")
+    env.save(stats_path)
+    print(f"Training completed. Model saved to {final_path}")
+    print(f"Normalization stats saved to {stats_path}")
+
+if __name__ == "__main__":
+    main()
