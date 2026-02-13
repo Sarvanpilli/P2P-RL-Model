@@ -1,0 +1,109 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+myenv/
+venv/
+.env
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*,cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# GSD Methodology & Agent Directories
+.agent/
+.gsd/
+.gemini/
+gemini/
+
+# Project Specific - Large Data & Datasets
+*.csv
+!test_day_profile.csv  # Keep small test files if needed
+dataset/
+data/
+archive/
+unused/
+processed_*.csv
+merged_dataset*.csv
+
+# Models & Checkpoints (All Phases)
+models/
+models_*/
+*.zip
+*.pkl
+*.pth
+*.pt
+*.h5
+*.ckpt
+normalization_config.json
+
+# Training Logs & TensorBoard
+tensorboard_logs/
+tb_logs/
+logs/
+logs_*/
+experiments/
+
+# Results & Plots
+results/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+report/
+results_*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+.directory
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp

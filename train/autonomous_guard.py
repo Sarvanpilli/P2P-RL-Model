@@ -47,6 +47,12 @@ class AutonomousGuard:
         self.tracer = ActionTracer()
         self.timestep_hours = timestep_hours
 
+        self.prev_actions = np.zeros((n_agents, 3)) # For Jitter Clipping
+        
+    def reset(self):
+        """Resets internal state."""
+        self.prev_actions.fill(0.0)
+
     def process_intent(self, 
                       step: int, 
                       observations: np.ndarray, 
@@ -54,16 +60,6 @@ class AutonomousGuard:
                       state: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         The main control loop for a single timestep.
-        
-        Args:
-            step: Timestep idx
-            observations: Raw observation vector (flattened)
-            rl_actions: Raw actions from Neural Net (flattened)
-            state: Physical state [n_agents, 3] (Demand, SoC, PV)
-            
-        Returns:
-            final_actions: Safe, Executable actions [n_agents*3]
-            info: Log info
         """
         rl_actions_reshaped = rl_actions.reshape(self.n_agents, 3)
         obs_reshaped = observations.reshape(self.n_agents, -1) # Flattened obs per agent
@@ -72,66 +68,78 @@ class AutonomousGuard:
         guard_info = {
             "fallback_triggered": 0,
             "safety_violations": 0,
-            "ood_events": 0
+            "ood_events": 0,
+            "jitter_events": 0
         }
         
-        for i in range(self.n_agents):
-            agent_obs = obs_reshaped[i]
-            agent_state = state[i]
-            agent_intent = rl_actions_reshaped[i]
-            
-            # --- Step 1: Health Monitor (OOD Check) ---
-            is_ood, z_score = self.supervisor.detect_distribution_shift(agent_obs)
-            metrics = {"z_score": z_score}
-            
-            status = "OK"
-            final_act = None
-            
-            if is_ood:
-                # CRITICAL: Input is weird. Trusting NN is dangerous.
-                # Trigger Fallback.
-                status = "FALLBACK_OOD"
-                final_act = self.supervisor.get_fallback_action()
-                guard_info["ood_events"] += 1
-                guard_info["fallback_triggered"] += 1
-            else:
-                # --- Step 2: Deterministic Optimization (Layer 2) ---
-                # "Optimize" the intent to be feasible.
-                # FeasibilityFilter expects batch, so we wrap briefly
-                # Ideally, filter logic should be per-agent or vectorized. 
-                # Our filter is vectorized. We can call it for the whole batch outside loop,
-                # but to mix Fallback logic, we might need granular control.
-                # Let's run optimization for this agent (using sliced inputs)
-                
-                # ...Wait, FeasibilityFilter is vectorized. 
-                # Let's re-structure: 
-                # 1. Check OOD for ALL agents.
-                # 2. Identify who needs Fallback.
-                # 3. For others, run Optimizer.
-                # 4. Check Hard Constraints.
-                pass 
-                
-        # --- Vectorized Implementation ---
+        # --- Jitter Clipping (Pre-Optim) ---
+        # Limit the rate of change of action to prevent high-frequency oscillations.
+        # Max Slew Rate: 0.8 (allows 80% range swing per step).
+        # This prevents -1.0 to 1.0 (2.0 swing) in one step, but allows agile movement.
+        max_slew = 0.8
         
-        # 1. Health / OOD Checks
-        # Currently Supervisor OOD is per-observation.
+        # Clip current intent to be within [prev - slew, prev + slew]
+        # Actions are roughly expected to be in [-1, 1] or scaled. 
+        # But wait, rl_actions might be large if unnormalized?
+        # The env action space is physical kW.
+        # Oh, strict normalization mentioned in requirements. 
+        # If env uses normalized PPO actions [-1, 1], then this works.
+        # But 'raw_action' comes from Env.step -> is it physical or normalized?
+        # PPO outputs [-1, 1]. Env wrapper scales it?
+        # EnergyMarketEnvRobust defines action_space as Box(-max, max).
+        # So PPO unscales it? Or we are using VecNormalize?
+        # We are using VecNormalize with norm_obs=False, norm_reward=True.
+        # But standard PPO assumes action space is target. SB3 will unscale if it knows bounds? No.
+        # PPO outputs clipped to action space. 
+        # So inputs here are PHYSICAL kW.
+        # If physical, 0.8 kW is tiny. 
+        # We need relative slew. 0.8 * Capacity?
+        # Let's assume normalized actions inside Guard?
+        # "rl_actions" passed to Guard are from "raw_action" in Env.py.
+        # env.step(action): raw_action = action.reshape...
+        # So it IS physical.
+        
+        # Let's derive max slew from capacity.
+        # Max Charge = battery_max_charge_kw. 
+        # Allow full range in 2 steps? -> Max Slew = Max Charge.
+        # Let's use 100% of Max Charge as limit per step.
+        # Ideally, we allow 0 -> Max in one step. But -Max -> Max in one step is bad.
+        # Let's limit change to 1.5 * limit ? 
+        # Or just skip this complicated check and rely on REWARD penalty?
+        # User REQ: "Clip any jittery actions".
+        # Let's implement a safe slew rate of "Max Charge kW" per step.
+        # If I was at -25kW, I can go to 0kW, but not +25kW.
+        
+        slew_limit = np.array([
+            self.optimizer.battery_max_charge_kw, # Batt
+            self.optimizer.battery_max_charge_kw * 2, # Grid (looser)
+            1.0 # Price (arbitrary)
+        ])
+        
+        lower_bound = self.prev_actions - slew_limit
+        upper_bound = self.prev_actions + slew_limit
+        
+        # Apply Clipping
+        rl_actions_clipped = np.clip(rl_actions_reshaped, lower_bound, upper_bound)
+        
+        # Check if we actually clipped significantly
+        if not np.allclose(rl_actions_clipped, rl_actions_reshaped, atol=1e-3):
+             guard_info["jitter_events"] += 1
+
+        # Calculate mask
         mask_fallback = np.zeros(self.n_agents, dtype=bool)
         
-        # (Placeholder for real mean/std loading)
-        # Assuming no stats loaded yet, OOD will be always False.
-        
         # 2. Optimization (Layer 2)
-        # Run filter on ALL intentions
-        # Note: Optimization happens even if some are OOD, but we overwrite them later.
+        # Run filter on CLIPPED intentions
         optimized_actions, _ = self.optimizer.filter_action(
-            rl_actions_reshaped, state
+            rl_actions_clipped, state
         )
         
         # 3. Hard Safety Check (Layer 3) & Final Selection
         final_actions = np.zeros_like(rl_actions_reshaped)
         
         for i in range(self.n_agents):
-            intent = rl_actions_reshaped[i]
+            intent = rl_actions_reshaped[i] # Log original intent
             opt_act = optimized_actions[i]
             ag_state = state[i]
             
@@ -141,18 +149,10 @@ class AutonomousGuard:
             )
             
             if not is_safe:
-                # VETO! Optimizer failed to find safe action?
-                # Or Model Logic mismatch.
-                # Trigger Fallback.
+                # VETO!
                 status = "VETOED"
                 final_act = self.supervisor.get_fallback_action()
                 guard_info["safety_violations"] += 1
-                guard_info["fallback_triggered"] += 1
-                # Log the reason?
-            elif mask_fallback[i]:
-                # OOD Trigger
-                status = "FALLBACK_OOD"
-                final_act = self.supervisor.get_fallback_action()
                 guard_info["fallback_triggered"] += 1
             else:
                 # All Good
@@ -172,6 +172,9 @@ class AutonomousGuard:
                 safety_status=status,
                 metrics={"reason": reason if not is_safe else "OK"}
             )
+        
+        # Update state persistence
+        self.prev_actions = final_actions.copy()
             
         return final_actions.flatten(), guard_info
 

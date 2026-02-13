@@ -24,7 +24,7 @@ class MultiP2PEnergyEnv(gym.Env):
         self.rng = np.random.RandomState(seed)
         # Per-agent parameters (can be vectorized or scalar)
         cfg = config or {}
-        self.battery_capacity = cfg.get('battery_capacity_kwh', 10.0)  # per agent
+        self.battery_capacity = cfg.get('battery_capacity_kwh', 10.0)  # per agent (#Replace to state of charge of the battery)
         self.max_power = cfg.get('max_power_kw', 5.0)
         self.charge_eff = cfg.get('charge_eff', 0.95)
         self.grid_price_baseline = cfg.get('grid_price_baseline', 0.2)  # $/kWh baseline
@@ -106,7 +106,7 @@ class MultiP2PEnergyEnv(gym.Env):
         # If action < 0: agent wants to buy '-action' kW from market (or charge battery)
         # We simulate battery charging/discharging given action and local surplus/deficit.
         # Compute available local surplus (gen - demand)
-        local_surplus = gen - demand  # could be negative
+        local_surplus = gen - demand  # could be negative #supress and Deficit of the local area.
         # Agents may use battery to meet deficit or store surplus; action decides net to/from market.
         # For simplicity: battery changes are result of residual after local consumption and market trades.
         # Prepare orders for matching engine: positive sells, negative buys
