@@ -18,6 +18,12 @@ def preprocess_hybrid_data():
         df_solar = pd.read_csv(solar_file)
         print(f"Loaded Solar Data: {df_solar.shape}")
         
+        # Fix column names: Ausgrid uses '_kw' suffix, strip it for consistency
+        rename_map = {col: col.replace('_kw', '') for col in df_solar.columns if col.endswith('_kw')}
+        if rename_map:
+            df_solar = df_solar.rename(columns=rename_map)
+            print(f"Renamed {len(rename_map)} columns to strip '_kw' suffix: {list(rename_map.keys())[:4]}...")
+        
         # Check wind file path
         if not os.path.exists(wind_file):
             # Try searching? Or assume it's in evaluation/
@@ -208,7 +214,17 @@ def preprocess_hybrid_data():
         json.dump(config, f, indent=4)
     print(f"Normalization config saved to {config_file}")
     
-    # 7. Output
+    # 7. Data Quality Validation
+    print("--- Data Quality Validation ---")
+    agent_cols = [c for c in normalized_df.columns if 'demand' in c or 'pv' in c or 'wind' in c]
+    for c in agent_cols:
+        col_max = normalized_df[c].max()
+        col_nonzero = (normalized_df[c] > 0).sum()
+        print(f"  {c}: max={col_max:.4f}, non-zero={col_nonzero}/{len(normalized_df)} ({col_nonzero/len(normalized_df):.1%})")
+        if col_nonzero == 0:
+            print(f"  ⚠️  WARNING: Column {c} is ALL ZEROS — check source data mapping!")
+    
+    # 8. Output
     normalized_df.to_csv(output_file, index=False)
     print(f"--- Data Fusion Complete ---")
     print(f"Total synchronized hours: {len(normalized_df)}")

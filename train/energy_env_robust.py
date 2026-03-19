@@ -7,7 +7,6 @@ Refactored to use MicrogridNode and Real Data.
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
 import pandas as pd
 import os
 from typing import Dict, List, Tuple, Any, Optional
@@ -31,62 +30,6 @@ class EnergyMarketEnvRobust(gym.Env):
 
     metadata = {"render_modes": ["human"], "render_fps": 4}
 
-    def __init__(self,
-                 n_agents: int = 4, # Backward compat
-                 n_prosumers: int = None, # New explicit
-                 n_consumers: int = None, # New explicit
-                 timestep_hours: float = 1.0,
-                 max_line_capacity_kw: float = 200.0,
-                 per_agent_max_kw: float = 200.0,
-                 battery_capacity_kwh: float = 50.0,
-                 battery_max_charge_kw: float = 25.0,
-                 battery_roundtrip_eff: float = 0.95,
-                 overload_multiplier: float = 50.0,
-                 forecast_horizon: int = 0,
-                 data_file: str = "test_day_profile.csv",
-                 random_start_day: bool = True,
-                 seed: Optional[int] = None,
-                 enable_ramp_rates: bool = True,
-                 ramp_limit_kw_per_hour: float = 10.0,
-                 enable_losses: bool = True,
-                 line_resistance_ohms: float = 0.05,
-                 grid_voltage_kv: float = 0.4, # 400V
-                 enable_predictive_obs: bool = False, # Phase 4 Flag
-                 forecast_noise_std: float = 0.05, # Phase 5 (Stochasticity)
-                 diversity_mode: bool = False, # Phase 5 (Heterogeneity)
-                 **kwargs):
-        
-        super().__init__()
-        
-        # --- Type Logic ---
-        # 1. Agent Typing & count
-        if n_prosumers is not None and n_consumers is not None:
-             self.n_prosumers = int(n_prosumers)
-             self.n_consumers = int(n_consumers)
-             self.n_agents = self.n_prosumers + self.n_consumers
-        else:
-             # Default fallback
-             self.n_prosumers = int(n_agents)
-             self.n_consumers = 0
-             self.n_agents = int(n_agents)
-
-        # 2. Configurations
-        self.timestep_hours = float(timestep_hours)
-        self.forecast_noise_std = float(forecast_noise_std)
-        self.diversity_mode = diversity_mode
-        
-        # Dynamic Grid Scaling: Base 200kW is for ~4-5 agents. Scale by sqrt(N/5).
-        # Or simpler: Base per agent. 
-        # Update 4: "max_line_capacity_kw = base * sqrt(n_agents)" isn't quite right from prompt logic 
-        # "Make grid capacity configurable... OR scale...". Let's apply scaling logic only if N large.
-        # Logic: If N > 10, scale capacity.
-        # User prompt: "max_line_capacity_kw = base_capacity_kw * sqrt(n_agents)"
-        # But 'base' is assumed to be the provided arg? Let's treat arg as 'base'
-        # Actually, let's just implement the formula: Cap = Arg * sqrt(N/5) ?
-        # Prompt says: "Scale programmatically: max_line_capacity_kw = base_capacity_kw * sqrt(n_agents)"
-        # I will assume the input arg is the BASE coefficient.
-        # Note: If N=4, sqrt(4)=2. If input=100 (per agent?), no input is 'capacity'.
-        # Let's say input is 'Base Capacity Global'.
     def __init__(self, 
                  n_agents=4, 
                  data_file="processed_hybrid_data.csv", 
@@ -114,7 +57,6 @@ class EnergyMarketEnvRobust(gym.Env):
         self.enable_ramp_rates = enable_ramp_rates
         self.enable_losses = enable_losses
         self.forecast_horizon = forecast_horizon
-        self.enable_predictive_obs = enable_predictive_obs
         self.enable_predictive_obs = enable_predictive_obs
         self.forecast_noise_std = forecast_noise_std
         
@@ -253,100 +195,7 @@ class EnergyMarketEnvRobust(gym.Env):
                  ev_node.battery_capacity_kwh = 62.0
                  # SOC returns? 
                  # Complex dynamics. Let's assume it stays at last value.
-        
-        # Guard
-        # AutonomousGuard expects: n_agents, battery_capacity_kwh, battery_max_charge_kw, timestep_hours, grid_voltage_kv
-        # But we have heterogeneous agents now. 
-        # Check AutonomousGuard signature: it takes scalar capacity/rate?
-        # If scalar, we might need to pass lists or max?
-        # File view shows: __init__(self, n_agents, battery_capacity_kwh, battery_max_charge_kw, timestep_hours, grid_voltage_kv)
-        # It seems to assume homogeneous agents or scalar inputs.
-        # Let's pass the max values or lists if it supports them.
-        # If it doesn't support lists, we might need to update Guard or pass a "safe upper bound".
-        # Let's assume it wants scalars for now (based on old code).
-        # We'll pass the MAX capacity and rate to ensure safety logic doesn't under-constrain?
-        # Or better: check if it uses them for *all* agents uniformly.
-        # If so, passing 62.0 (EV) might allow others to violate their 5.0 limit?
-        # Yes.
-        # Refactoring Guard to handle heterogeneity is out of scope unless necessary.
-        # Step 1: Pass scalars.
-        # Step 2: See if it works.
-        self.timestep_hours = 1.0
-        self.grid_voltage_kv = 0.4
-        
-        # We pass 62.0 and 7.0 as "system specs" or similar.
-        # Actually in Phase 5 we should probably update Guard to read from Nodes?
-        # The previous code passed `self.nodes` in one version? 
-        # "refactored to use MicrogridNode" comment suggests it might match.
-        # But the error says it expects `battery_capacity_kwh`, etc.
-        # So it's the old Guard.
-        # Let's pass the EV specs (max in system) to avoid crashing, 
-        # knowing that individual node constraints are ALSO checked in `MicrogridNode.step`.
-        # The Guard is for *Grid* safety mostly?
-        
-        self.guard = AutonomousGuard(
-            n_agents=self.n_agents,
-            battery_capacity_kwh=62.0, # Max
-            battery_max_charge_kw=7.0, # Max
-            timestep_hours=self.timestep_hours,
-            grid_voltage_kv=self.grid_voltage_kv
-        )
-        
-        self.matching_engine = MatchingEngine()
-        self.reward_tracker = RewardTracker(n_agents=self.n_agents)
 
-        # --- Data Loading ---
-        self.data_file = data_file
-        try:
-            self.df = pd.read_csv(self.data_file)
-            print(f"Loaded {len(self.df)} rows from {self.data_file}")
-        except Exception as e:
-            print(f"WARNING: Could not load {self.data_file}: {e}")
-            print("Using sinusoidal mock data fallback.")
-            self.df = None
-
-        # --- Spaces ---
-        action_low = np.array([-battery_max_charge_kw, -per_agent_max_kw, 0.0], dtype=np.float32)
-        action_high = np.array([ battery_max_charge_kw,  per_agent_max_kw, 1.0], dtype=np.float32)
-        self.action_space = spaces.Box(
-            low=np.tile(action_low, (self.n_agents,)),
-            high=np.tile(action_high, (self.n_agents,)),
-            dtype=np.float32
-        )
-
-        # Phase 4: History Window
-        self.history_window_size = 4
-        self.history_buffer = {
-            'demand': np.zeros((self.n_agents, self.history_window_size)),
-            'pv': np.zeros((self.n_agents, self.history_window_size))
-        }
-        self.prev_action = np.zeros((self.n_agents, 3)) # Always init
-        
-        if self.enable_predictive_obs:
-            # New Predictive Space (Normalized [-1, 1])
-            # Base(7) + History(8) + Forecast(2*H)
-            # + Static Profile (2): [Cap_Norm, PV_Peak_Norm]
-            n_features = 7 + 8 + 2 * self.forecast_horizon + 2
-            
-            self.observation_space = spaces.Box(
-                low=-1.0, high=1.0,
-                shape=(self.n_agents * n_features,),
-                dtype=np.float32
-            )
-        else:
-            # Legacy Phase 3 Space (Physical Units)
-            # Obs: [Dem, SoC, PV, TotalExport, TotalImport, CO2, GridBuy, GridSell] + Forecasts
-            base_dim = 8
-            obs_dim = base_dim + 4 * self.forecast_horizon
-            high_val = np.finfo(np.float32).max / 8.0
-            self.observation_space = spaces.Box(
-                low=-high_val, high=high_val,
-                shape=(self.n_agents * obs_dim,),
-                dtype=np.float32
-            )
-
-        self.rng = np.random.default_rng(seed)
-        self.reset(seed=seed)
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict]:
         if seed is not None:
@@ -675,7 +524,7 @@ class EnergyMarketEnvRobust(gym.Env):
         )
         
         # Update Prev Action for next step
-        self.prev_action = current_action.copy()
+        self.prev_actions = current_action.copy()
         r_info = self.reward_tracker.get_info()
         
         # Per-agent trade (kW): positive = export, negative = import
@@ -712,12 +561,6 @@ class EnergyMarketEnvRobust(gym.Env):
             return 0.50, 0.10 # High retail during peak
         return 0.20, 0.10
 
-    def _get_obs(self, total_export, total_import):
-        """Dispatch based on mode."""
-        if self.enable_predictive_obs:
-            return self._get_obs_predictive(total_export, total_import)
-        else:
-            return self._get_obs_legacy(total_export, total_import)
 
     def _get_obs(self, total_export, total_import):
         """
