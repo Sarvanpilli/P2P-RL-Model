@@ -1,0 +1,789 @@
+P2P-RL-Model: Full Technical Deep-Dive
+Code Review & Thesis Presentation Reference
+Generated: 2026-02-19
+================================================================================
+
+
+OVERVIEW: THE FOUR-FILE EXECUTION PIPELINE
+================================================================================
+
+These four files form the complete action-to-reward pipeline of the multi-agent
+P2P energy trading system:
+
+    Agent Decision (PPO)
+           |
+    [safety_filter.py]  <-- FeasibilityFilter: clips physically impossible actions
+           |
+    [multi_p2p_env.py / energy_env_robust.py]  <-- Environment: physics simulation
+           |
+    [matching_engine.py]  <-- MatchingEngine: double auction, P2P trade clearing
+           |
+    Reward Signal --> back to PPO
+
+Each file is a layer of abstraction in the simulation stack. Together they model
+a realistic microgrid where prosumers (agents that both produce and consume energy)
+trade power peer-to-peer before falling back to the main grid.
+
+
+================================================================================
+FILE 1: envs/multi_p2p_env.py  --  Base P2P Environment
+================================================================================
+
+PURPOSE
+-------
+This is the prototype Gymnasium environment -- the foundational simulation of a
+multi-agent P2P energy market. It serves as the conceptual base before the more
+complex energy_env_robust.py takes over for actual training. Think of it as the
+simplest valid reinforcement learning environment for this problem.
+
+Key role: Defines state space, action space, synthetic energy profiles, battery
+physics, market clearing via MatchingEngine, and a multi-component reward
+function including fairness.
+
+
+CLASS: MultiP2PEnergyEnv(gym.Env)
+----------------------------------
+Inherits from OpenAI Gymnasium's gym.Env. This means it must implement reset(),
+step(), and define observation_space and action_space.
+
+
+__init__ -- Constructor
+-----------------------
+Signature:
+    def __init__(self, n_agents=5, timestep_hours=1.0, episode_len=24, seed=None, config=None)
+
+Parameters:
+  - n_agents=5        : Number of prosumer agents. Determines size of all arrays.
+  - timestep_hours=1.0: Each step = 1 hour. Critical for kW -> kWh conversion:
+                          energy_kwh = power_kw x timestep_hours
+  - episode_len=24    : One episode = 24 timesteps (1 day)
+  - seed              : Random seed for reproducibility of synthetic profiles
+  - config            : Optional dictionary of physical parameters
+
+Key initialized variables:
+  Variable              | Value      | Meaning
+  ----------------------|------------|---------------------------------------
+  battery_capacity      | 10.0 kWh   | Size of each agent's battery
+  max_power             | 5.0 kW     | Maximum power each agent can trade
+  charge_eff            | 0.95       | Battery round-trip efficiency (95%)
+  grid_price_baseline   | $0.20/kWh  | Default electricity price
+  grid_carbon           | 0.6 kg/kWh | CO2 intensity of grid electricity
+  renewable_carbon      | 0.05 kg/kWh| CO2 intensity of P2P renewable energy
+  shaping_coef          | 1.0        | Multiplier for reward shaping bonuses
+
+Observation Space:
+  obs_low  = [0.0, 0.0, 0.0, 0.0] x n_agents
+  obs_high = [max_gen, max_demand, battery_capacity, 100.0] x n_agents
+  For each agent: [generation_kw, demand_kw, soc_kwh, last_market_price]
+  Total observation dimension = 4 x n_agents
+
+Action Space:
+  action_space = Box(low=[-max_power]*n, high=[+max_power]*n)
+  Continuous vector of length n_agents. Each element = net power agent wants to trade:
+    Positive -> sell to the P2P market
+    Negative -> buy from the P2P market (or charge battery)
+
+Internal State Variables:
+  self.t             : Current timestep counter (0 to 23)
+  self.soc           : Battery State-of-Charge array, shape (n,), init to 50% capacity
+  self.gen_profile   : Pre-generated solar generation shape (n, 24) -- sinusoidal
+  self.demand_profile: Pre-generated demand shape (n, 24) -- cosine
+  self.last_price    : Last clearing price seen by each agent, shape (n,)
+  self.total_profits : Cumulative profits across episode, shape (n,) -- for fairness
+
+
+reset() -- Episode Initialization
+----------------------------------
+Called at start of each episode. Returns (observation, info).
+
+Step-by-step logic:
+  1. Reset timestep: self.t = 0
+  2. Increment episode counter: self.episode += 1
+  3. Reset battery SOC to 50%: self.soc = np.full(n, battery_capacity * 0.5)
+  4. Reset last price to baseline: self.last_price = np.full(n, grid_price_baseline)
+  5. Generate randomized sinusoidal profiles:
+
+       hours = np.arange(24)                    # [0, 1, ..., 23]
+       ph = self.rng.uniform(0, 2*pi, size=n)  # Random phase offset per agent
+
+       # Generation: sine wave peaking at midday (peak = 5kW)
+       gen_profile = 5.0 x max(0, sin(2*pi/24 x (hours + ph)))
+
+       # Demand: cosine wave (highest at night/morning, peak = 6kW)
+       demand_profile = 6.0 x (0.5 + 0.5 x cos(2*pi/24 x (hours + ph)))
+
+       This gives each agent a slightly different production/consumption curve.
+
+  6. Reset cumulative profits: self.total_profits = np.zeros(n)
+  7. Return initial observation via _get_obs()
+
+
+step(action) -- Core Simulation Loop
+--------------------------------------
+Heart of the environment. Called once per timestep.
+
+Input:  action -- shape (n,), clipped to [-max_power, +max_power]
+Output: (obs, reward_scalar, terminated, truncated, info)
+
+PHASE 1: Data Retrieval
+  gen    = gen_profile[:, t]      # Current generation (kW) for all agents
+  demand = demand_profile[:, t]   # Current demand (kW) for all agents
+
+PHASE 2: Market Matching
+  orders = action.copy()          # Agent's desired trade quantities
+  trades, clearing_price, grid_import = matching_engine.match(orders)
+
+  Returns:
+    trades[i]      : Actual traded power (kW) -- positive=sold, negative=bought
+    clearing_price : The cleared P2P market price ($/kWh)
+    grid_import    : Net grid power (positive = grid supplied to system)
+
+PHASE 3: Battery SOC Update
+  After trading, each agent has residual energy -> goes into/out of battery.
+
+  net_local_after_trade[i] = gen[i] - demand[i] - trades[i]
+
+  Interpretation:
+    Positive -> agent has surplus energy after trading -> charge battery
+    Negative -> agent has deficit -> discharge battery
+
+  Battery Charging (net > 0):
+    net_kwh  = net x timestep_hours
+    charge   = min(net_kwh x charge_eff, battery_capacity - soc[i])
+    soc[i]  += charge
+    leftover = net_kwh - charge / charge_eff    # Curtailed (wasted)
+
+  Battery Discharging (net < 0):
+    need_kwh       = -net x timestep_hours
+    discharge      = min(need_kwh / charge_eff, soc[i])
+    soc[i]        -= discharge
+    remaining_need = need_kwh - discharge x charge_eff    # Met by grid
+
+  Efficiency note: 0.95 efficiency accounts for real-world battery losses.
+    When charging:    stored_kwh = input_kwh x 0.95
+    When discharging: output_kwh = discharged_kwh x 0.95
+
+PHASE 4: Reward Computation
+
+  For each agent i:
+
+  Revenue from P2P selling:
+    revenue_i = max(0, traded_kwh_i) x clearing_price
+
+  Cost of P2P buying:
+    cost_i = max(0, -traded_kwh_i) x clearing_price
+
+  Grid interaction cost (approximate):
+    Remaining deficit after battery is covered by grid at grid_price_baseline
+
+  Carbon emissions:
+    traded_emission_i = |traded_kwh_i| x renewable_carbon  (0.05 kg/kWh)
+    grid_emission_i   = grid_kwh_i x grid_carbon            (0.60 kg/kWh)
+    -> P2P energy is predominantly renewable, grid is fossil-heavy
+
+  Battery degradation:
+    batt_cost_i = 0.01 x |traded_kwh_i|    (small placeholder $/kWh cycled)
+
+  Per-agent reward:
+    reward_i = profits_i - 0.1 x emissions_i - batt_cost_i
+
+PHASE 5: Fairness Penalty (Gini Coefficient)
+
+  Motivation: Without fairness term, RL might exploit weaker agents. The Gini
+  coefficient penalizes unequal profit distribution.
+
+  Gini Coefficient:
+    cum_profits = total_profits_so_far + profits_this_step
+    Gini = (Sum_i Sum_j |cumprofit_i - cumprofit_j|) / (2 x n x Sum cumprofit_i)
+
+    Gini = 0: Perfect equality (all agents equally profitable)
+    Gini = 1: Maximum inequality (one agent takes everything)
+
+  Applied as:
+    fairness_penalty_each = 0.2 x gini
+    rewards_i = rewards_i - fairness_penalty_each
+
+  This is a shared penalty -- every agent equally penalized when system is unfair.
+
+  Final scalar reward for PPO:
+    reward_scalar = Sum_i reward_i
+    (All agent rewards summed into one scalar for centralized policy)
+
+
+_get_obs() -- Observation Construction
+---------------------------------------
+Builds flat vector of length 4 x n_agents:
+  obs = [gen_0, demand_0, soc_0, price_0, gen_1, demand_1, soc_1, price_1, ...]
+Each agent contributes 4 features: generation, demand, SOC, last market price.
+
+
+_get_gen_t() / _get_demand_t()
+--------------------------------
+Simply index into pre-generated profiles:
+  return gen_profile[:, t]      # shape (n,)
+  return demand_profile[:, t]   # shape (n,)
+If t >= episode_len, returns zeros (handles boundary safely).
+
+
+================================================================================
+FILE 2: train/energy_env_robust.py  --  Advanced Training Environment
+================================================================================
+
+PURPOSE
+-------
+This is the research-grade training environment used in all Phase 4 and Phase 5
+training runs. It replaces synthetic profiles with real-world data
+(processed_hybrid_data.csv), adds physical constraints (ramp rates, distribution
+losses), implements heterogeneous agent archetypes (Solar, Wind, EV, Standard),
+and includes a full safety supervision layer via AutonomousGuard.
+
+It is far more complex than multi_p2p_env.py and represents the actual system
+being trained and evaluated.
+
+
+CLASS: EnergyMarketEnvRobust(gym.Env)
+--------------------------------------
+
+__init__ -- Constructor
+-----------------------
+The effective Phase 5 constructor initializes:
+
+Agent Heterogeneity (diversity_mode=True):
+  Agent | Type                  | Battery             | Max Charge | Source
+  ------|-----------------------|---------------------|------------|----------
+    0   | Solar Prosumer        | 5 kWh               | 2.5 kW     | Solar PV
+    1   | Wind Prosumer         | 5 kWh               | 2.5 kW     | Wind turbine
+    2   | EV (Vehicle-to-Grid)  | 62 kWh(night)/2kWh  | 7 kW       | Home PV+V2G
+    3   | Standard Prosumer     | 10 kWh              | 5.0 kW     | Solar PV
+
+Key Parameters:
+  enable_ramp_rates=True   : Limits how fast agent can change power output
+  enable_losses=True       : Simulates I^2*R resistive losses on distribution lines
+  forecast_horizon=4       : Agents can see 4 hours into the future (lookahead)
+  forecast_noise_std=0.05  : Gaussian noise on forecasts (uncertainty modeling)
+  random_start_day=True    : Each episode starts at a random dataset point
+
+Action Space (Phase 5):
+  action_space = Box(low=-1, high=1, shape=(n_agents x 3,))
+  Each agent has a 3-dimensional action:
+    action[0] = Battery power (kW)     -- positive=charge, negative=discharge
+    action[1] = Trade quantity (kW)    -- positive=sell to P2P, negative=buy
+    action[2] = Price bid (norm [0,1]) -- limit price for double auction
+
+Observation Space:
+  obs_dim = (7 + 2 + 4 + 2*forecast_horizon) x n_agents
+  7 base features: [SoC, retail_price, feed_in_price, sin(time), cos(time),
+                    total_export, total_import]
+  2 weather features
+  4 agent-type one-hot
+  2 x H forecast features
+
+
+_setup_agents() -- Heterogeneous Agent Creation
+------------------------------------------------
+  for i in range(n_agents):
+    if   i == 0: MicrogridNode(battery=5kWh,  rate=2.5kW) -> Solar
+    elif i == 1: MicrogridNode(battery=5kWh,  rate=2.5kW) -> Wind
+    elif i == 2: MicrogridNode(battery=62kWh, rate=7.0kW) -> EV/V2G
+    else:        MicrogridNode(battery=10kWh, rate=5.0kW) -> Standard
+
+Each MicrogridNode stores its own SOC, capacity, and handles battery physics.
+
+
+_load_data() -- Real-World Dataset
+------------------------------------
+  self.df = pd.read_csv("processed_hybrid_data.csv")
+  self.max_idx = len(df) - 24    # Safety buffer
+
+Loads timestep-indexed rows of: agent_N_demand, agent_N_pv, agent_1_wind,
+temperature_2m, windspeed_100m -- all pre-normalized to [0,1].
+
+
+_apply_ev_constraints() -- EV Temporal Dynamics
+-------------------------------------------------
+Simulates real EV behavior:
+  During day (8:00 AM - 5:00 PM): EV is away, accessible battery = only 2 kWh
+  At night:                        EV is home, full 62 kWh is available
+
+  if 8 <= hour < 17:
+      ev_node.battery_capacity_kwh = 2.0
+      if ev_node.soc > 2.0: ev_node.soc = 2.0    # Clamp visible SOC
+  else:
+      ev_node.battery_capacity_kwh = 62.0
+
+
+reset() -- Episode Initialization
+-----------------------------------
+Step-by-step:
+  1. Random start: Pick random row from dataset as starting point
+       day_start_idx = rng.integers(0, max_start)
+
+  2. Reset each MicrogridNode with a random initial SOC between 20%-80%:
+       start_soc = rng.uniform(0.2, 0.8) x node.battery_capacity_kwh
+       node.reset(soc=start_soc)
+
+  3. Pre-fill history buffer with 4 rows of historical demand and PV data
+
+  4. Reset RewardTracker and AutonomousGuard internal state
+
+  5. Return initial observation: _get_obs(0.0, 0.0) with export=0, import=0
+
+
+step(action) -- Master Step Function
+--------------------------------------
+Step is decomposed into 3 sub-functions:
+
+  def step(self, action):
+      raw_action = action.reshape(n_agents, 3)          # (N*3,) -> (N, 3)
+      state_data     = self._step_physics_prep(raw_action)   # Phase 1: Physics
+      market_results = self._step_market(state_data)          # Phase 2: Trading
+      obs, reward, info = self._step_grid_and_reward(...)     # Phase 3: Reward
+      self.timestep_count += 1
+      self.current_idx    += 1
+      return obs, reward, done, truncated, info
+
+
+_step_physics_prep(raw_action) -- Physics & Safety Layer
+---------------------------------------------------------
+Step 1: Collect current state
+  demands, pvs, co2_weather = _get_current_data()     # From real dataset
+  current_socs = [node.soc for node in nodes]
+
+Step 2: Run Autonomous Guard (Safety Filter)
+  state_for_guard = stack([demands, socs, pvs], axis=1)    # (N, 3)
+  safe_action_flat, guard_info = guard.process_intent(
+      step=timestep_count,
+      observations=current_obs,
+      rl_actions=raw_action.flatten(),
+      state=state_for_guard
+  )
+  safe_action = safe_action_flat.reshape(n_agents, 3)
+
+  AutonomousGuard is a supervisory safety layer that can override agent actions
+  if they violate hard physical constraints (SOC bounds, grid capacity, ramp rates).
+
+Step 3: Execute battery physics via MicrogridNode
+  for i, node in enumerate(nodes):
+      result = node.step(
+          battery_action_kw = safe_action[i, 0],
+          current_demand_kw = demands[i],
+          current_pv_kw     = pvs[i],
+          dt_hours          = timestep_hours
+      )
+
+  MicrogridNode.step() updates the SOC:
+      SOC_new = SOC_old + battery_action_kw x dt_hours x efficiency
+
+  Returns: {soc, net_load_kw, throughput_delta}
+
+
+_step_market(safe_action) -- Market Clearing
+---------------------------------------------
+Step 1: Extract trade intents and price bids
+  trade_intents = safe_action[:, 1]       # kW -- positive=sell, negative=buy
+  bid_prices    = safe_action[:, 2]       # Normalized [0,1]
+  real_prices   = bid_prices x 0.50      # Scale to [$0, $0.50/kWh]
+
+Step 2: Grid price competition filter
+  retail_p, feed_in_p = _get_grid_prices()
+  # Time-of-Use: Peak hours (17-21h) -> retail=0.50, else retail=0.20
+  # Feed-in tariff always = 0.10 $/kWh
+
+  # Seller asking MORE than retail: buyers prefer grid -> trade fails
+  violation_sell = (real_prices > retail_p) AND sellers
+  # Buyer bidding LESS than feed-in: sellers prefer grid -> trade fails
+  violation_buy  = (real_prices < feed_in_p) AND buyers
+
+  trade_intents[violation_sell] = 0.0    # Cancel bad sell orders
+  trade_intents[violation_buy]  = 0.0    # Cancel bad buy orders
+
+Step 3: Pass to MatchingEngine
+  bids_input = stack([trade_intents, real_prices], axis=1)    # (N, 2)
+  trades, market_price, net_grid_flow, match_info = matching_engine.match(
+      bids_input, grid_buy_price=retail_p, grid_sell_price=feed_in_p
+  )
+
+
+_step_grid_and_reward(physics_state, market_results) -- Reward Computation
+---------------------------------------------------------------------------
+Step 1: Grid impact
+  total_export  = Sum max(0, trades[i])       # Total P2P + grid export
+  total_import  = Sum max(0, -trades[i])      # Total P2P + grid import
+  line_overload = max(0, max(export, import) - max_line_capacity)
+
+Step 2: Distribution Losses (I^2 * R)
+  net_loads          = [node_result.net_load_kw for each node]
+  total_abs_flow_kw  = Sum|net_loads|                       # Total network traffic
+  total_current_amps = total_abs_flow_kw / grid_voltage_kv  # I = P/V
+  loss_kw            = (I^2) x line_resistance / 1000       # I^2*R loss in kW
+
+  This is a physics-accurate model of Ohmic heating losses in distribution cables.
+
+Step 3: Reward components
+  Component            | Formula                               | Purpose
+  ---------------------|---------------------------------------|------------------------
+  Profit               | trades[i] x market_price              | Reward for trading
+  Grid Import Penalty  | max(0, -trades[i]) x 0.5             | Penalize grid dependence
+  Peak Penalty         | x1.5 if hour in [17,21)              | Cost during peak hours
+  Smoothing Penalty    | lambda x Sum|action_t - action_t-1|  | Punish jittery actions
+  SOC Penalty          | (soc - 50)^2 x 0.001                | Keep battery near 50%
+  Deep Discharge       | (0.10 - soc%) x 10 if soc% < 10%    | Prevent battery damage
+  V2G Bonus            | +10 if EV.soc > 80% at 7AM           | Reward EV readiness
+  Overload Cost        | line_overload x multiplier / n        | Punish grid congestion
+  Fairness Penalty     | fairness_coeff x Gini(profits)        | Equitable distribution
+  Battery Wear         | throughput_delta x 0.05               | Penalize cycling
+
+  Total reward:
+    R = Sum_i(profit_i + V2G_bonus_i - grid_penalty_i - soc_penalty_i
+              - overload_i - battery_wear_i - smoothing_i
+              - deep_discharge_i) - fairness_penalty
+
+
+_get_obs() -- Phase 5 Observation Vector
+-----------------------------------------
+For each agent i, the observation includes:
+  [soc_norm, retail_norm, feed_in_norm, sin(time), cos(time),
+   total_export_norm, total_import_norm,          # 7 base features
+   temperature_norm, windspeed_norm,               # 2 weather features
+   type_onehot[0..3],                             # 4 agent type features
+   [f_dem_t+1, f_gen_t+1, ..., f_dem_t+H, f_gen_t+H]]   # 2xH forecast
+
+If forecast_noise_std > 0, forecasts are corrupted with Gaussian noise.
+
+Time encoding (cyclical):
+  sin_time = sin(2*pi x hour / 24)
+  cos_time = cos(2*pi x hour / 24)
+  -> Avoids discontinuity at midnight (hour 23 -> 0) that confuses neural nets
+
+Grid prices (Time-of-Use):
+  Peak hours (17 <= h < 21): retail = $0.50/kWh
+  Off-peak:                  retail = $0.20/kWh
+  Feed-in tariff (always):           = $0.10/kWh
+
+
+================================================================================
+FILE 3: market/matching_engine.py  --  P2P Market Clearing
+================================================================================
+
+PURPOSE
+-------
+This module implements a Uniform Price Double Auction -- the economic mechanism
+that determines who trades with whom and at what price in the P2P energy market.
+It is called every timestep from within the environment's step() function.
+
+Real-world analogy: This is how energy markets like NEM (Australia) or day-ahead
+power markets work -- buyers and sellers submit bids, and a clearing algorithm
+finds the price that maximizes traded volume.
+
+
+CLASS: MatchingEngine
+---------------------
+
+__init__
+  def __init__(self, grid_buy_price=0.20, grid_sell_price=0.10)
+    grid_buy_price  = $0.20/kWh: The retail electricity price (upper bound for P2P)
+    grid_sell_price = $0.10/kWh: The feed-in tariff (lower bound for P2P)
+
+  The P2P price should always lie between feed-in and retail, otherwise rational
+  agents would prefer the grid over P2P trading.
+
+
+match(bids, grid_buy_price, grid_sell_price) -- The Auction
+------------------------------------------------------------
+Input:
+  bids: np.array shape (n_agents, 2)
+        Column 0: Quantity (kW) -- positive=sell order, negative=buy order
+        Column 1: Price limit ($/kWh)
+
+Returns:
+  trades:         np.array (n_agents,)  -- actual executed trades (kW)
+  clearing_price: float                  -- the uniform settlement price
+  grid_flow:      float                  -- net grid interaction (+ve = import)
+  info:           dict                   -- volume, price, flow
+
+STEP 1: Order Book Construction
+  # Separate sellers (qty > 0) and buyers (qty < 0)
+  sellers_idx = where(quantities > 1e-6)
+  buyers_idx  = where(quantities < -1e-6)
+
+  # Build sell book: sorted by Ask Price ASCENDING (cheapest seller first)
+  sell_orders.sort(key=lambda x: x['price'])
+
+  # Build buy book: sorted by Bid Price DESCENDING (highest bidder first)
+  buy_orders.sort(key=lambda x: x['price'], reverse=True)
+
+  Why this order? Classical economic bid-ask sorting maximizes traded volume.
+  Cheapest sellers match with the most eager buyers first.
+
+STEP 2: Price Discovery (Finding the Clearing Price)
+  Algorithm iterates through sorted order books simultaneously -- like a zipper:
+
+  while s_i < len(sell_orders) and b_i < len(buy_orders):
+      seller = sell_orders[s_i]
+      buyer  = buy_orders[b_i]
+
+      if buyer['price'] >= seller['price']:     # Spread positive: deal possible
+          qty = min(seller['qty'], buyer['qty'])
+
+          # Marginal price = midpoint of last matched pair
+          marginal_price = (buyer['price'] + seller['price']) / 2.0
+
+          # Reduce remaining quantities
+          seller['qty'] -= qty
+          buyer['qty']  -= qty
+
+          # Advance pointer of whichever side was fully consumed
+          if seller['qty'] < 1e-9: s_i += 1
+          if buyer['qty'] < 1e-9:  b_i += 1
+      else:
+          break     # Spread has crossed (ask > bid): no more profitable matches
+
+  Uniform Price Rule: The final marginal_price (from the LAST successful match)
+  becomes the clearing price for ALL trades. This is the defining feature of a
+  Uniform Price Double Auction -- everyone pays/receives the same price.
+
+STEP 3: Trade Execution
+  Reset order books. Re-iterate and execute orders that are "in the money":
+    Sellers eligible: Ask price <= clearing_price  (profitable at this price)
+    Buyers eligible:  Bid price >= clearing_price  (willing to pay this)
+
+  Volume constraint:
+    valid_supply = Sum[seller.qty for sellers where Ask <= clearing_price]
+    valid_demand = Sum[buyer.qty  for buyers  where Bid >= clearing_price]
+    tx_volume    = min(valid_supply, valid_demand)   # Smaller side limits trading
+
+  Trade allocation (priority order -- cheapest sellers first):
+    remaining = tx_volume
+    for seller in sell_orders:
+        if seller['price'] <= clearing_price and remaining > 0:
+            amount = min(seller['qty'], remaining)
+            trades[seller['id']] += amount    # Positive = sold
+            remaining -= amount
+
+  Same for buyers:
+    for buyer in buy_orders:
+        if buyer['price'] >= clearing_price and remaining > 0:
+            amount = min(buyer['qty'], remaining)
+            trades[buyer['id']] -= amount     # Negative = bought
+            remaining -= amount
+
+STEP 4: Grid Residual Handling
+  After P2P clearing, unmatched quantities go to the grid:
+
+  # Unmatched sellers -> export to grid (if their ask <= feed-in tariff)
+  for seller in unmatched_sellers:
+      if seller['price'] <= g_sell:
+          trades[seller['id']] += seller['qty']
+          grid_export += seller['qty']
+
+  # Unmatched buyers -> import from grid (if their bid >= retail price)
+  for buyer in unmatched_buyers:
+      if buyer['price'] >= g_buy:
+          trades[buyer['id']] -= buyer['qty']
+          grid_import += buyer['qty']
+
+  grid_flow = grid_export - grid_import
+
+STEP 5: Conservation Check
+  net_trade_sum = Sum trades
+  # Should equal grid_flow (energy balance)
+  if |net_trade_sum - grid_flow| > 1e-5:
+      print("CRITICAL: Energy Conservation Violation!")
+
+  This enforces the power balance law -- the algebraic sum of all agents' net
+  trades must equal the net grid interaction.
+
+
+================================================================================
+FILE 4: train/safety_filter.py  --  Feasibility Constraint Layer
+================================================================================
+
+PURPOSE
+-------
+The FeasibilityFilter is a stateless pre-processing layer that sits between the
+RL agent's raw neural network output and the environment's step() function.
+Its job is to guarantee physical feasibility -- ensuring no action ever violates
+hard physical laws, even during early training when the agent is random.
+
+This is critical because if physically impossible actions reach the simulation,
+the battery SOC could go negative or above capacity, creating numerical
+instability and incorrect rewards.
+
+
+CLASS: FeasibilityFilter
+------------------------
+
+__init__
+  def __init__(self, battery_capacity_kwh=50.0, battery_max_charge_kw=25.0,
+               timestep_hours=1.0)
+
+  Parameter               | Value | Meaning
+  ------------------------|-------|----------------------------------------
+  battery_capacity_kwh    | 50.0  | Maximum energy storable
+  battery_max_charge_kw   | 25.0  | Maximum charge/discharge rate
+  timestep_hours          | 1.0   | Duration of timestep (kW -> kWh)
+
+
+filter_action(raw_action, state) -- Main Filter Function
+---------------------------------------------------------
+Properties: Deterministic, Stateless, Idempotent (applying twice = applying once)
+
+Input:
+  raw_action: shape (n_agents, 3) -> [battery_kw, trade_kw, price_bid]
+  state:      shape (n_agents, 3) -> [demand_kw, soc_kwh, pv_kw]
+
+Output:
+  safe_action: shape (n_agents, 3)  -- clipped/modified action
+  changed:     bool                  -- True if any modification was made
+
+
+CONSTRAINT 1: Battery Power Clipping
+  Why: Battery cannot charge beyond capacity, discharge below 0, or exceed
+  its rated power.
+
+  Math:
+    max_charge_kwh = max(0, battery_capacity - soc[i])         # Space remaining
+    max_charge_kw  = min(battery_max_charge_kw, max_charge_kwh / timestep_hours)
+
+    max_discharge_kwh = soc[i]                                  # Energy available
+    max_discharge_kw  = min(battery_max_charge_kw, max_discharge_kwh / timestep_hours)
+
+    batt_kw[i] = clip(raw_batt_kw[i], -max_discharge_kw, max_charge_kw)
+
+  Example:
+    Battery: 50 kWh capacity, current SOC = 48 kWh, max rate = 25 kW
+    Space remaining = 2 kWh -> max_charge_kw = min(25, 2/1) = 2 kW
+    If agent says "charge at 20 kW", filter clips to 2 kW.
+
+
+CONSTRAINT 2: Trade Quantity Clipping
+  Why: Agent can only sell energy it actually has (local surplus). Cannot sell
+  what it doesn't have.
+
+  Net position calculation:
+    net_position[i] = pv[i] - demand[i] - committed_battery[i]
+    -> Actual power balance at the agent's node AFTER battery action is committed
+
+  Enforcement logic:
+    Condition              | Rule                   | Why
+    -----------------------|------------------------|-----------------------------
+    net_position >= 0      | trade <= net_position  | Can only sell what you have
+    (surplus)              |                        |
+    net_position < 0       | trade <= 0 (no sell)   | If you need power, cannot
+    (deficit)              |                        | be a seller
+
+    for i in range(n_agents):
+        pos = net_position[i]
+        if pos >= 0:
+            trade_kw[i] = min(trade_kw[i], pos)      # Cap export at surplus
+        else:
+            trade_kw[i] = min(trade_kw[i], 0.0)      # Force trade <= 0 if deficit
+
+  Example:
+    Agent has PV=3kW, demand=5kW, battery charging at 1kW
+    net_position = 3 - 5 - 1 = -3 kW (deficit)
+    Even if agent tries to sell (trade > 0), filter sets trade = 0.
+
+
+CONSTRAINT 3: Price Bid Clipping
+  safe_action[:, 2] = clip(price_bid, 0.0, 1.0)
+  Simple hard bounds. Normalized price kept in [0, 1], which maps to
+  [0, $0.50/kWh] after scaling in _step_market.
+
+
+CHANGE DETECTION
+  changed = not np.allclose(raw_action, safe_action, atol=1e-5)
+  If nothing changed, changed=False.
+  Use for logging/monitoring how often agent violates constraints.
+  High violation rate = poor training signal, agent hasn't learned physics yet.
+
+
+================================================================================
+THE FULL EXECUTION PIPELINE
+================================================================================
+
+Complete, end-to-end flow for a SINGLE TIMESTEP:
+
+Step 1: PPO Policy outputs raw_action (shape: N x 3)
+             |
+Step 2: FeasibilityFilter.filter_action()
+         * Clip battery_kw to [-max_discharge, +max_charge]
+         * Clip trade_kw to available net_position
+         * Clip price_bid to [0, 1]
+             |
+Step 3: AutonomousGuard.process_intent()
+         * Secondary safety check (grid voltage, ramp rates)
+         * May further constrain or override actions
+             |
+Step 4: MicrogridNode.step() for each agent
+         * Update SOC: soc += battery_kw x dt x efficiency
+         * Compute net_load_kw = demand - pv + battery_kw
+         * Compute throughput_delta for wear cost
+             |
+Step 5: _step_market()
+         * Extract (trade_kw, price_bid) from safe_action
+         * Apply price competition filter (cancel bad bids)
+         * MatchingEngine.match():
+              a. Sort sell orders ASC by Ask price
+              b. Sort buy orders DESC by Bid price
+              c. Walk order books: find marginal price
+              d. Execute trades at uniform clearing price
+              e. Route residuals to/from grid
+              f. Verify energy conservation
+         * Returns: trades[], clearing_price, grid_flow
+             |
+Step 6: _step_grid_and_reward()
+         * Compute: total_export, total_import, line_overload
+         * Compute: distribution_loss = I^2 x R / 1000
+         * Compute: grid_import_penalty, peak_penalty, smoothing_penalty,
+                    deep_discharge_penalty, V2G_bonus, SOC_penalty, battery_wear
+         * RewardTracker.calculate_total_reward():
+              R = Sum(profit + V2G) - Sum(all penalties) - Gini_fairness
+             |
+Step 7: _get_obs() builds next observation:
+         [SOC, retail, feed_in, sin_t, cos_t, export, import,
+          temp, wind, agent_type_onehot x 4, forecast x 2H]
+             |
+Step 8: Return (obs, reward, done, truncated, info) to PPO
+         PPO uses reward to update policy via Proximal Policy Optimization
+
+
+================================================================================
+KEY MATHEMATICAL EQUATIONS SUMMARY
+================================================================================
+
+Equation               | Formula
+-----------------------|-------------------------------------------------------
+Energy balance         | gen + discharge - charge - demand - trade = 0
+SOC update             | SOC_{t+1} = SOC_t + batt_kw x dt x eta
+Distribution loss      | P_loss = (P_total/V)^2 x R / 1000
+Market clearing        | P* = argmax(volume) where Supply(P*) >= Demand(P*)
+Reward                 | R = Sum(profit_i + bonus_i - penalties_i) - Gini x lam
+Gini coefficient       | G = Sum_i Sum_j |x_i - x_j| / (2n x Sum x_i)
+Safety (battery)       | batt_kw in [-min(eta*SOC, rate), min((Cap-SOC)/dt, rate)]
+Safety (trade)         | trade <= max(0, PV - Demand - batt_kw)
+Smoothing penalty      | P_smooth = lambda x Sum_a |action_t_a - action_t-1_a|
+Peak penalty           | P_peak = 1.5 x import_kw  if hour in [17, 21)
+
+
+================================================================================
+INTERACTION FLOW BETWEEN ALL FOUR FILES
+================================================================================
+
+energy_env_robust.py  (orchestrator)
+   |-- calls FeasibilityFilter.filter_action()       [safety_filter.py]
+   |         | -- safe action
+   |-- calls MatchingEngine.match()                  [matching_engine.py]
+   |         | -- trades, clearing_price, grid_flow
+   |-- calls RewardTracker.calculate_total_reward()  [reward_tracker.py]
+   |         | -- scalar reward
+   +-- returns (obs, reward, done, truncated, info)  --> PPO agent
+
+multi_p2p_env.py is the PROTOTYPE that follows the same pattern but with
+synthetic data and simpler physics -- useful for understanding the design
+before the full complexity of energy_env_robust.py.
+
+
+================================================================================
+Last updated: 2026-02-19  |  P2P-RL-Model Phase 5 Code Review Reference
+================================================================================
