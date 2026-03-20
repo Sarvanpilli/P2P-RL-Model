@@ -163,25 +163,19 @@ class MatchingEngine:
         grid_export = 0.0
         grid_import = 0.0
         
-        # Unmatched Sellers -> Grid (if profitable)
+        # Unmatched Sellers -> Grid (MUST clear to maintain physical balance)
         for s in current_sell_orders:
             if s['qty'] > 1e-9:
-                # Can sell to grid if Ask <= Feed-in
-                # OR if we just dump everything to grid?
-                # Usually, if you didn't clear in P2P, you sell to grid at Feed-in.
-                # But only if your Ask is low enough?
-                # Let's assume yes, if Ask <= Feed-in.
-                if s['price'] <= g_sell:
-                    trades[s['id']] += s['qty']
-                    grid_export += s['qty']
+                # Force settlement with grid at feed-in tariff
+                trades[s['id']] += s['qty']
+                grid_export += s['qty']
         
-        # Unmatched Buyers -> Grid (if willing)
+        # Unmatched Buyers -> Grid (MUST clear to maintain physical balance)
         for b in current_buy_orders:
             if b['qty'] > 1e-9:
-                # Buy from grid if Bid >= Retail
-                if b['price'] >= g_buy:
-                    trades[b['id']] -= b['qty']
-                    grid_import += b['qty']
+                # Force settlement with grid at retail tariff
+                trades[b['id']] -= b['qty']
+                grid_import += b['qty']
                     
         grid_flow = grid_export - grid_import
         
@@ -196,8 +190,7 @@ class MatchingEngine:
         net_trade_sum = np.sum(trades)
         if abs(net_trade_sum - grid_flow) > 1e-5:
             # This is a critical error
-            print(f"CRITICAL: Energy Conservation Violation. Net Trades: {net_trade_sum}, Grid Flow: {grid_flow}")
-            # Force balance? No, better to warn/fail in tests.
+            raise ValueError(f"CRITICAL: Energy Conservation Violation. Net Trades: {net_trade_sum}, Grid Flow: {grid_flow}")
         
         info = {
             "total_volume": matched_volume,

@@ -1,4 +1,4 @@
-import unittest
+    import unittest
 import numpy as np
 import sys
 import os
@@ -6,20 +6,20 @@ import os
 # Add parent directory to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from train.energy_env_improved import EnergyMarketEnv
+from train.energy_env_robust import EnergyMarketEnvRobust
 
 class TestDeploymentReadiness(unittest.TestCase):
     def setUp(self):
-        self.env = EnergyMarketEnv(n_agents=4, forecast_horizon=1)
+        self.env = EnergyMarketEnvRobust(n_agents=4, forecast_horizon=1)
         self.env.reset()
 
     def test_extreme_shortage(self):
         """Test behavior when Demand is High and PV is Zero (Night/Winter)."""
         print("\n--- Test: Extreme Shortage ---")
-        # Force state: High Demand, Zero PV, Low SoC
-        self.env.state[:, 0] = 50.0 # Max Demand
-        self.env.state[:, 1] = 5.0  # Low SoC
-        self.env.state[:, 2] = 0.0  # Zero PV
+        # Override data fetcher
+        self.env._get_current_data = lambda: (np.full(4, 50.0), np.zeros(4), np.zeros(2))
+        for node in self.env.nodes:
+            node.soc = 5.0
         
         # Action: Try to discharge (impossible) and buy nothing (bad idea)
         # Agent should ideally buy from grid.
@@ -47,10 +47,10 @@ class TestDeploymentReadiness(unittest.TestCase):
     def test_extreme_surplus(self):
         """Test behavior when PV is High and Demand is Zero (Sunny Day)."""
         print("\n--- Test: Extreme Surplus ---")
-        # Force state: Zero Demand, Full SoC, High PV
-        self.env.state[:, 0] = 0.0
-        self.env.state[:, 1] = self.env.battery_capacity_kwh # Full
-        self.env.state[:, 2] = 40.0 # High PV
+        # Override data fetcher and SoC
+        self.env._get_current_data = lambda: (np.zeros(4), np.full(4, 40.0), np.zeros(2))
+        for node in self.env.nodes:
+            node.soc = node.battery_capacity_kwh
         
         # Action: Try to charge (impossible) and sell nothing
         raw_action = np.zeros((4, 3))
@@ -78,12 +78,12 @@ class TestDeploymentReadiness(unittest.TestCase):
         # Agent 0
         raw_action[0, 0] = 0.0
         raw_action[0, 1] = 10.0 # Sell
-        raw_action[0, 2] = 0.10
+        raw_action[0, 2] = 0.20 # Scaled by 0.5 inside env -> $0.10
         
         # Agent 1
         raw_action[1, 0] = 0.0
         raw_action[1, 1] = -10.0 # Buy
-        raw_action[1, 2] = 0.20
+        raw_action[1, 2] = 0.40 # Scaled by 0.5 inside env -> $0.20
         
         obs, reward, terminated, truncated, info = self.env.step(raw_action.flatten())
         

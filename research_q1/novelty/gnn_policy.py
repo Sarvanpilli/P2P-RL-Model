@@ -185,6 +185,19 @@ class CTDEGNNPolicy(ActorCriticPolicy):
         return Normal(mean_actions, action_std)
 
     # ─────────────────────────────────────────────────────────────────────────
+    def _predict(self, observation: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+        """Override SB3's _predict to handle raw PyTorch Normal distributions correctly."""
+        node_emb, _ = self._get_graph_embeddings(observation)
+        batch_size = observation.shape[0]
+        mean_actions = self.actor_net(node_emb).view(batch_size, -1)
+        
+        if deterministic:v 
+            return mean_actions
+            
+        action_std = torch.exp(self.log_std).expand_as(mean_actions)
+        return Normal(mean_actions, action_std).rsample()
+
+    # ─────────────────────────────────────────────────────────────────────────
     def predict_values(self, obs: torch.Tensor) -> torch.Tensor:
         """Required by SB3's rollout collection to bootstrap value estimates."""
         _, global_emb = self._get_graph_embeddings(obs)

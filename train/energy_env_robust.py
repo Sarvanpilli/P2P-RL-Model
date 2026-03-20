@@ -74,25 +74,30 @@ class EnergyMarketEnvRobust(gym.Env):
         self.matching_engine = MatchingEngine(grid_buy_price=0.20, grid_sell_price=0.10)
         
         # Guard
-        # AutonomousGuard expects: n_agents, battery_capacity_kwh, battery_max_charge_kw, timestep_hours, grid_voltage_kv
-        # Passing Max Specs for Hybrid System Safety
         self.timestep_hours = 1.0
         self.grid_voltage_kv = 0.4
         
+        agent_specs = [{"capacity": n.battery_capacity_kwh, "max_charge": n.battery_max_charge_kw} for n in self.nodes]
         self.guard = AutonomousGuard(
             n_agents=self.n_agents,
-            battery_capacity_kwh=62.0, # Max EV
-            battery_max_charge_kw=7.0, # Max EV
+            agent_specs=agent_specs,
             timestep_hours=self.timestep_hours
         )
         
         self.reward_tracker = RewardTracker(n_agents)
         
         # Spaces
-        # Action: [Battery(kW), Trade(kW), Bid($)]
-        # Range: [-1, 1], scaled inside step
-        # Flattened to (N*3,) to match SB3 VecEnv expectations & avoid shape mismatch
-        self.action_space = spaces.Box(low=-1, high=1, shape=(n_agents * 3,), dtype=np.float32)
+        # heterogeneous physical bounds for each agent
+        lows = []
+        highs = []
+        for node in self.nodes:
+            lows.extend([-node.battery_max_charge_kw, -self.max_line_capacity_kw, 0.0])
+            highs.extend([node.battery_max_charge_kw, self.max_line_capacity_kw, 1.0])
+        
+        self.action_space = spaces.Box(
+            low=np.array(lows, dtype=np.float32),
+            high=np.array(highs, dtype=np.float32)
+        )
         
         # Observation: 
         # Base: SOC, Retail, FeedIn, SinTime, CosTime, Exp, Imp (7)
@@ -276,8 +281,9 @@ class EnergyMarketEnvRobust(gym.Env):
         # Weather
         temp = row.get('temperature_2m', 20.0)
         wind = row.get('windspeed_100m', 5.0)
+        weather = np.array([temp, wind])
         
-        return np.array(dems), np.array(gens), np.array([temp, wind])
+        return np.array(dems[:self.n_agents]), np.array(gens[:self.n_agents]), weather
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
         # SB3 flattens actions for VecEnvs. Reshape to (N, 3)
@@ -489,42 +495,16 @@ class EnergyMarketEnvRobust(gym.Env):
         grid_import_kw = np.maximum(0.0, -trades)
         grid_import_penalty = grid_import_kw * 0.5 
 
-        # Phase 5 Penalties
-        # 1. Peak Window (17-21h)
-        curr_hour = self.current_idx % 24
-        peak_penalties = self.reward_tracker.calculate_peak_penalty(grid_import_kw, curr_hour)
-        
-        # 2. Smoothing (Action Jitter)
-        # We need raw_action from step(). We only have trades here. 
-        # But wait, step() calls this. We can access self.prev_actions buffer
-        # 'physics_state' contains 'safe_action'
-        current_action = physics_state['safe_action']
-        smoothing_penalty = self.reward_tracker.calculate_smoothing_penalty(current_action, self.prev_actions)
-        
-        # 3. Deep Discharge
-        deep_discharge_penalties = np.zeros(self.n_agents)
-        for i, node in enumerate(self.nodes):
-            deep_discharge_penalties[i] = (0.10 - (node.soc/node.battery_capacity_kwh)) * 10.0 if (node.soc/node.battery_capacity_kwh) < 0.10 else 0.0
-
-        # 3. V2G Bonus
-        caps = np.array([n.battery_capacity_kwh for n in self.nodes])
-        v2g_bonus = self.reward_tracker.calculate_v2g_bonus(socs_final, caps, curr_hour)
-        
         reward = self.reward_tracker.calculate_total_reward(
             profits=trades * market_price, # Revenue
-            grid_import_penalties=grid_import_penalty + peak_penalties, # Base + Peak
+            grid_import_penalties=grid_import_penalty, # Base import penalty
             soc_penalties=(socs_final - 50.0)**2 * 0.001, 
             grid_overload_costs=np.ones(self.n_agents) * line_overload_kw * self.overload_multiplier / self.n_agents,
             battery_costs=throughputs * 0.05,
-            export_penalties=np.zeros(self.n_agents),
-            smoothing_penalties=smoothing_penalty,
-            deep_discharge_penalties=deep_discharge_penalties,
-            v2g_bonus=v2g_bonus,
             total_export_kw=total_export
         )
         
-        # Update Prev Action for next step
-        self.prev_actions = current_action.copy()
+        self.prev_actions = physics_state['safe_action'].copy()
         r_info = self.reward_tracker.get_info()
         
         # Per-agent trade (kW): positive = export, negative = import

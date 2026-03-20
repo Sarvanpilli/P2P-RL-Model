@@ -8,14 +8,14 @@ import os
 # Add parent directory to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from train.energy_env_improved import EnergyMarketEnv
+from train.energy_env_robust import EnergyMarketEnvRobust
 
 def test_overfitting():
     print("\n--- Test: RL Overfitting (Deterministic) ---")
     
     # Create a deterministic environment
     # We fix the seed and disable forecast uncertainty for this test
-    env = EnergyMarketEnv(
+    env = EnergyMarketEnvRobust(
         n_agents=2,
         forecast_horizon=0,
         forecast_uncertainty_std=0.0,

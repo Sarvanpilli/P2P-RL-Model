@@ -15,7 +15,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '.
 # Import base class and components
 from train.energy_env_recovery import EnergyMarketEnvRecovery
 from research_q1.novelty.safety_layer import SafetyFilter
-from research_q1.novelty.market_mechanism import LiquidityPool
+from research_q1.novelty.market_mechanism import DynamicMarketMechanism
 
 # Safe import for MicrogridNode
 try:
@@ -37,11 +37,17 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
     def __init__(self, 
                  enable_safety: bool = True,
                  enable_p2p: bool = True,
+                 market_type: str = "dynamic",
+                 alpha_p2p: float = 0.01,
+                 base_delta: float = 0.03,
                  **kwargs):
         super().__init__(**kwargs)
         
         self.enable_safety = enable_safety
         self.enable_p2p = enable_p2p
+        self.market_type = market_type
+        self.alpha_p2p = alpha_p2p
+        self.base_delta = base_delta
         
         # Initialize Safety Filters (always create, conditionally apply)
         self.safety_filters = []
@@ -54,8 +60,21 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             self.safety_filters.append(sf)
             
         # Initialize Market Mechanism
-        self.liquidity_pool = LiquidityPool()
-        
+        if self.market_type == "dynamic":
+            self.liquidity_pool = DynamicMarketMechanism(base_delta=self.base_delta)
+        else:
+            # Old naive auction mechanism (mid-price calculation)
+            self.liquidity_pool = DynamicMarketMechanism(base_delta=0.0)
+            
+        # Override observation space to account for +4 market features per agent
+        # Base (7) + Market (4) = 11 base features + 2 weather + 4 type + 8 forecast + 1 peer = 26 features
+        obs_features = 26
+        self.observation_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(self.n_agents * obs_features,),
+            dtype=np.float32
+        )
 
         # Tracking
         self.safety_violations = 0
@@ -65,6 +84,9 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         out = super().reset(seed=seed, options=options)
         self.safety_violations = 0
         self.accumulated_profit = 0.0
+        self.liquidity_pool.last_p2p_volume = 0.0
+        self.liquidity_pool.last_delta = 0.03
+        self.liquidity_pool.last_prices = {"seller_price": 0.08, "buyer_price": 0.20}
         return out
 
 
@@ -202,7 +224,11 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
                 sin_time,
                 cos_time,
                 total_export / 20.0,
-                total_import / 20.0
+                total_import / 20.0,
+                self.liquidity_pool.last_p2p_volume / 20.0,
+                self.liquidity_pool.last_delta / 0.1,
+                self.liquidity_pool.last_prices["seller_price"] / 0.5,
+                self.liquidity_pool.last_prices["buyer_price"] / 0.5
             ]
             
             # Concatenate
@@ -292,13 +318,31 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         self.liquidity_pool.update_prices(retail, feed_in)
         
         if self.enable_p2p:
-            # Clear Market
-            cleared_p2p, clearing_price, market_stats = self.liquidity_pool.clear_market(p2p_requests)
+            # Clear Market using Dynamic Mechanism. Invert requests to match Market's convention (negative=sell)
+            market_output = self.liquidity_pool.clear_market(-p2p_requests)
+            
+            # Invert trades back to match Environment's convention (positive=sell)
+            cleared_p2p = -np.array(market_output["p2p_trades"])
+            
+            seller_revenue = np.array(market_output["seller_revenue"])
+            buyer_cost = np.array(market_output["buyer_cost"])
+            grid_import_arr = np.array(market_output["grid_import"])
+            grid_export_arr = np.array(market_output["grid_export"])
+            p2p_vol = market_output["p2p_volume"]
+            seller_price = market_output["seller_price"]
+            buyer_price = market_output["buyer_price"]
+            delta = market_output["delta"]
         else:
-            # No P2P: Force zero P2P trades
+            # No P2P: Force zero P2P trades, all residual goes to grid
             cleared_p2p = np.zeros(self.n_agents)
-            clearing_price = (retail + feed_in) / 2.0
-            market_stats = {'traded_volume': 0.0}
+            buyer_cost = np.zeros(self.n_agents)
+            seller_revenue = np.zeros(self.n_agents)
+            grid_import_arr = np.maximum(p2p_requests, 0)
+            grid_export_arr = np.abs(np.minimum(p2p_requests, 0))
+            p2p_vol = 0.0
+            seller_price = feed_in
+            buyer_price = retail
+            delta = 0.0
 
         
         # === PHYSICS EXECUTION ===
@@ -321,28 +365,43 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             
             physical_net_load = node_res['net_load_kw']
             
-            # Grid Flow = Physical Need - P2P Support
-            grid_flow = physical_net_load - cleared_p2p[i]
+            # Grid Flow = Physical Need + P2P Action
+            # Seller: net_load(-5) + cleared(+3) = grid_flow(-2) -> 2kW export to grid
+            # Buyer: net_load(+5) + cleared(-2) = grid_flow(+3) -> 3kW import from grid
+            # Cheater: net_load(-1) + cleared(+5) = grid_flow(+4) -> 4kW expensive import penalty!
+            grid_flow = physical_net_load + cleared_p2p[i]
             
-            # Financial Calculation
-            step_reward = 0.0
+            # The REAL grid import/export must be strictly defined by final physical flow
+            # The market mechanism's 'unmatched' intent is an illusion if the physics can't deliver it.
+            actual_grid_import = max(0.0, grid_flow)
+            actual_grid_export = abs(min(0.0, grid_flow))
             
-            # 1. P2P Settlement
-            p2p_cost = cleared_p2p[i] * clearing_price
-            step_reward -= p2p_cost
+            # Replace the intent-based grid variables with ground-truth physics
+            grid_import_arr[i] = actual_grid_import
+            grid_export_arr[i] = actual_grid_export
             
-            # 2. Grid Settlement
-            if grid_flow > 0: # Import
-                grid_cost = grid_flow * retail
-                step_reward -= grid_cost
-                total_import += grid_flow
-            else: # Export
-                grid_rev = abs(grid_flow) * feed_in
-                step_reward += grid_rev
-                total_export += abs(grid_flow)
-                
-            rewards[i] = step_reward
-            self.accumulated_profit += step_reward
+            # 1. P2P Settlement (based on cleared trades)
+            p2p_profit = seller_revenue[i] - buyer_cost[i]
+            
+            # 2. Grid Settlement (based on final physical flow)
+            grid_cost = actual_grid_import * retail
+            grid_rev = actual_grid_export * feed_in
+            
+            total_import += actual_grid_import
+            total_export += actual_grid_export
+            
+            # Base financial profit
+            financial_profit = p2p_profit + grid_rev - grid_cost
+            
+            # Explicit Reward Shaping (Incentivize P2P, gentle grid penalty)
+            # beta_grid is LOW (0.01) so agents prefer P2P but won't trade at huge losses just to avoid grid
+            beta_grid = 0.01
+            
+            agent_p2p_vol = abs(cleared_p2p[i])
+            shaped_reward = financial_profit + (self.alpha_p2p * agent_p2p_vol) - (beta_grid * actual_grid_import)
+            
+            rewards[i] = shaped_reward
+            self.accumulated_profit += financial_profit
         
         # Global State Updates
         self.current_idx += 1
@@ -361,9 +420,14 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         obs = self._get_obs(total_export, total_import)
         
         info = {
-            'clearing_price': clearing_price,
-            'p2p_volume': market_stats['traded_volume'],
-            'profit': np.sum(rewards)
+            'p2p_volume': p2p_vol,
+            'grid_import': total_import,
+            'grid_export': total_export,
+            'seller_price': seller_price,
+            'buyer_price': buyer_price,
+            'delta': delta,
+            'profit': self.accumulated_profit,
+            'safety_violations': self.safety_violations
         }
         
         return obs, np.sum(rewards), done, truncated, info

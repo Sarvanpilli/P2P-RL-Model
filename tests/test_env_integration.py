@@ -6,12 +6,12 @@ import os
 # Add parent directory to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from train.energy_env_improved import EnergyMarketEnv
+from train.energy_env_robust import EnergyMarketEnvRobust
 
 class TestEnvIntegration(unittest.TestCase):
     def test_env_step(self):
         """Test that the environment steps correctly with the new MatchingEngine."""
-        env = EnergyMarketEnv(n_agents=4)
+        env = EnergyMarketEnvRobust(n_agents=4)
         obs, _ = env.reset()
         
         # Random action
@@ -22,7 +22,7 @@ class TestEnvIntegration(unittest.TestCase):
         
         # Check if info contains market data
         self.assertIn("market_price", info)
-        self.assertIn("grid_flow", info["market_info"]) # MatchingEngine returns this in info dict?
+        self.assertIn("total_export", info) # Check grid tracking metric
         # Wait, MatchingEngine returns (trades, price, grid_flow, info).
         # In env.step: matched_trades, market_price, grid_flow, market_info = self.matching_engine.match(grid_trade)
         # The env puts `market_price` in its own info.

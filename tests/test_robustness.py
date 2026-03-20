@@ -73,7 +73,8 @@ class TestRobustness(unittest.TestCase):
         print("\n--- Test: Env Physics Balance ---")
         self.env.reset()
         # Force a state
-        self.env.state[:, 1] = 25.0 # 50% SoC
+        for node in self.env.nodes:
+            node.soc = 25.0 # 50% SoC
         
         # Action: Charge and Discharge
         action = np.zeros((4, 3))
@@ -98,14 +99,14 @@ class TestRobustness(unittest.TestCase):
         # In Env: energy_discharged = power * dt / eff_discharge
         
         # Check what self.battery_eff is in env
-        eff = self.env.battery_eff
+        eff = self.env.nodes[0].battery_eff
         eff_sqrt = eff ** 0.5
         
         expected_soc_0 = 25.0 + 10.0 * 1.0 * eff_sqrt
         expected_soc_1 = 25.0 - 10.0 * 1.0 / eff_sqrt
         
-        self.assertAlmostEqual(self.env.state[0, 1], expected_soc_0, places=4)
-        self.assertAlmostEqual(self.env.state[1, 1], expected_soc_1, places=4)
+        self.assertAlmostEqual(self.env.nodes[0].soc, expected_soc_0, places=4)
+        self.assertAlmostEqual(self.env.nodes[1].soc, expected_soc_1, places=4)
         print("Physics Balance Verified.")
 
 if __name__ == '__main__':

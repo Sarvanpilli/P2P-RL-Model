@@ -3,13 +3,15 @@ import numpy as np
 class FeasibilityFilter:
     """
     Enforces hard physical constraints on agent actions.
+    Supports per-agent heterogeneous battery specs.
     """
     def __init__(self, 
                  battery_capacity_kwh=50.0,
                  battery_max_charge_kw=25.0,
                  timestep_hours=1.0):
-        self.battery_capacity_kwh = float(battery_capacity_kwh)
-        self.battery_max_charge_kw = float(battery_max_charge_kw)
+        # Support both scalar and per-agent array inputs
+        self.battery_capacity_kwh = np.asarray(battery_capacity_kwh, dtype=np.float64)
+        self.battery_max_charge_kw = np.asarray(battery_max_charge_kw, dtype=np.float64)
         self.timestep_hours = float(timestep_hours)
 
     def filter_action(self, raw_action, state, grid_buy_price=0.20, grid_sell_price=0.10):

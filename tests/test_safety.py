@@ -11,8 +11,8 @@ from train.safety_filter import FeasibilityFilter
 class TestSafetyFilter(unittest.TestCase):
     def setUp(self):
         self.filter = FeasibilityFilter(
-            battery_capacity_kwh=50.0,
-            battery_max_charge_kw=25.0,
+            battery_capacity_kwh=np.array([50.0, 50.0]),
+            battery_max_charge_kw=np.array([25.0, 25.0]),
             timestep_hours=1.0
         )
         self.n_agents = 2
@@ -27,7 +27,7 @@ class TestSafetyFilter(unittest.TestCase):
         self.state[1, 1] = 0.0
         
         # Action: Both try to CHARGE 10kW
-        raw_action = np.array([[10.0, 0.0], [10.0, 0.0]])
+        raw_action = np.array([[10.0, 0.0, 0.5], [10.0, 0.0, 0.5]])
         
         safe_action, corrections = self.filter.filter_action(raw_action, self.state)
         
@@ -44,7 +44,7 @@ class TestSafetyFilter(unittest.TestCase):
         self.state[1, 1] = 50.0
         
         # Action: Both try to DISCHARGE -10kW
-        raw_action = np.array([[-10.0, 0.0], [-10.0, 0.0]])
+        raw_action = np.array([[-10.0, 0.0, 0.5], [-10.0, 0.0, 0.5]])
         
         safe_action, corrections = self.filter.filter_action(raw_action, self.state)
         
@@ -59,7 +59,7 @@ class TestSafetyFilter(unittest.TestCase):
         self.state[0, 1] = 45.0
         
         # Action: Try to charge 10kW (10kWh in 1 hour)
-        raw_action = np.array([[10.0, 0.0], [0.0, 0.0]])
+        raw_action = np.array([[10.0, 0.0, 0.5], [0.0, 0.0, 0.5]])
         
         safe_action, corrections = self.filter.filter_action(raw_action, self.state)
         

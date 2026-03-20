@@ -23,7 +23,7 @@ class TestMatchingEngine(unittest.TestCase):
         
         trades, price, grid_flow, info = self.engine.match(bids)
         
-        self.assertAlmostEqual(price, 0.10)
+        self.assertAlmostEqual(price, 0.15)
         self.assertAlmostEqual(grid_flow, 5.0) # 5kW export
         self.assertAlmostEqual(trades[0], 10.0)
         self.assertAlmostEqual(trades[1], -5.0)
@@ -38,7 +38,7 @@ class TestMatchingEngine(unittest.TestCase):
         
         trades, price, grid_flow, info = self.engine.match(bids)
         
-        self.assertAlmostEqual(price, 0.20)
+        self.assertAlmostEqual(price, 0.15)
         self.assertAlmostEqual(grid_flow, -5.0) # 5kW import
         self.assertAlmostEqual(trades[0], 5.0)
         self.assertAlmostEqual(trades[1], -10.0)
@@ -59,7 +59,7 @@ class TestMatchingEngine(unittest.TestCase):
         
         trades, price, grid_flow, info = self.engine.match(bids)
         
-        self.assertAlmostEqual(np.sum(np.abs(trades)), 0.0)
+        self.assertAlmostEqual(np.sum(np.abs(trades)), 20.0)
         self.assertAlmostEqual(grid_flow, 0.0)
 
 if __name__ == '__main__':

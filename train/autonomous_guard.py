@@ -22,26 +22,47 @@ class AutonomousGuard:
     
     def __init__(self, 
                  n_agents: int,
-                 battery_capacity_kwh: float,
-                 battery_max_charge_kw: float,
-                 timestep_hours: float,
-                 normalization_stats_path: str = None):
+                 battery_capacity_kwh: float = None,
+                 battery_max_charge_kw: float = None,
+                 timestep_hours: float = 1.0,
+                 agent_specs: list = None,
+                 normalization_stats_path: str = None,
+                 **kwargs):
         
         self.n_agents = n_agents
         
+        # Build per-agent specs: list of {capacity, max_charge}
+        if agent_specs is not None:
+            self.agent_specs = agent_specs
+        elif battery_capacity_kwh is not None and battery_max_charge_kw is not None:
+            # Backward compat: scalar -> replicate for all agents
+            self.agent_specs = [
+                {"capacity": battery_capacity_kwh, "max_charge": battery_max_charge_kw}
+                for _ in range(n_agents)
+            ]
+        else:
+            # Default fallback
+            self.agent_specs = [
+                {"capacity": 50.0, "max_charge": 25.0}
+                for _ in range(n_agents)
+            ]
+        
+        # Per-agent arrays for vectorized operations
+        self.capacities = np.array([s["capacity"] for s in self.agent_specs])
+        self.max_charges = np.array([s["max_charge"] for s in self.agent_specs])
+        
         # --- Layer 2: Deterministic Optimizer ---
-        # We reuse the existing FeasibilityFilter as our "Optimizer"
-        # because it projects actions into the valid set (clipping).
+        # FeasibilityFilter now uses per-agent arrays
         self.optimizer = FeasibilityFilter(
-            battery_capacity_kwh=battery_capacity_kwh,
-            battery_max_charge_kw=battery_max_charge_kw,
+            battery_capacity_kwh=self.capacities,
+            battery_max_charge_kw=self.max_charges,
             timestep_hours=timestep_hours
         )
         
         # --- Layer 3: Safety Supervisor ---
+        # SafetySupervisor uses per-agent capacities
         self.supervisor = SafetySupervisor(
-            battery_capacity_kwh=battery_capacity_kwh
-            # Todo: Load obs stats for OOD detection
+            battery_capacity_kwh=self.capacities
         )
         
         self.tracer = ActionTracer()
@@ -110,11 +131,11 @@ class AutonomousGuard:
         # Let's implement a safe slew rate of "Max Charge kW" per step.
         # If I was at -25kW, I can go to 0kW, but not +25kW.
         
-        slew_limit = np.array([
-            self.optimizer.battery_max_charge_kw, # Batt
-            self.optimizer.battery_max_charge_kw * 2, # Grid (looser)
-            1.0 # Price (arbitrary)
-        ])
+        slew_limit = np.stack([
+            self.max_charges,             # Batt: per-agent max charge rate
+            self.max_charges * 2,         # Grid (looser)
+            np.ones(self.n_agents)        # Price (arbitrary)
+        ], axis=1)  # (N, 3)
         
         lower_bound = self.prev_actions - slew_limit
         upper_bound = self.prev_actions + slew_limit
@@ -145,7 +166,7 @@ class AutonomousGuard:
             
             # Check Safety of OPTIMIZED action
             is_safe, reason = self.supervisor.check_hard_constraints(
-                ag_state, opt_act, self.timestep_hours
+                ag_state, opt_act, self.timestep_hours, agent_idx=i
             )
             
             if not is_safe:

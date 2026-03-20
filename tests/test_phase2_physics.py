@@ -12,20 +12,20 @@ from train.energy_env_robust import EnergyMarketEnvRobust
 class TestPhase2Physics(unittest.TestCase):
     
     def setUp(self):
-        self.ramp_limit = 5.0 # 5 kW/h
+        self.ramp_limit = 1.0 # 1.0 kW/h, must be < 2.5 (default battery bounds)
         self.resistance = 0.1
         self.voltage = 0.4
         
         self.env = EnergyMarketEnvRobust(
             n_agents=2,
             enable_ramp_rates=True,
-            ramp_limit_kw_per_hour=self.ramp_limit,
-            enable_losses=True,
-            line_resistance_ohms=self.resistance,
-            grid_voltage_kv=self.voltage,
-            battery_capacity_kwh=50,
-            battery_max_charge_kw=20 # Max charge > Ramp limit
+            enable_losses=True
         )
+        self.env.line_resistance_ohms = self.resistance
+        self.env.grid_voltage_kv = self.voltage
+        
+        for n in self.env.nodes:
+            n.set_ramp_limit(self.ramp_limit)
         
     def test_ramp_rate_constraint(self):
         """Verify that battery power changes are limited by ramp rate."""
@@ -39,31 +39,17 @@ class TestPhase2Physics(unittest.TestCase):
         node0 = self.env.nodes[0]
         self.assertAlmostEqual(node0.last_power_kw, 0.0)
         
-        # Step 2: Request Max Charge (20 kW) -> Should be clipped to 5 kW (Ramp Limit)
+        # Step 2: Request Max Charge (20 kW) -> Should be clipped by action space to 2.5, then by ramp limit to 1.0
         # Action: [Bat, Trade, Price]
         action_max = np.array([20, 0, 0, 20, 0, 0], dtype=np.float32)
         _, _, _, _, info = self.env.step(action_max)
         
-        throughput_delta = info["battery_throughput_delta_kwh"][0]
-        # Throughput for 1 hour at 5kW = 5kWh (ignoring efficiency for moment or accounting for it)
-        # Effective Charge = min(20, Ramp=5) = 5.
-        
-        print(f"Requested: 20kW. Last: 0kW. Ramp: 5kW. Effective Throughput: {throughput_delta} kWh")
-        
-        # Depending on efficiency, throughput might be slightly different, but power should be 5.
-        # MicrogridNode logic: battery_action_kw is clipped.
-        # 5 kW * 1h * sqrt(eff) -> energy.
-        
         # Let's inspect the node's last_power_kw
         print(f"Node 0 Last Power: {node0.last_power_kw}")
-        self.assertAlmostEqual(node0.last_power_kw, 5.0, delta=0.1)
+        self.assertAlmostEqual(node0.last_power_kw, 1.0, delta=0.1)
         
-        # Step 3: Request -20 kW (Discharge). Last was +5. Limit is 5.
-        # Can go down to 0. (Delta -5).
-        # Bounds: [5-5, 5+5] = [0, 10].
-        # Wait, if I request -20, and bounds are [0, 10], it should clip to 0?
-        # Ramp constraint: current must be within [last - ramp, last + ramp].
-        # [0, 10]. Request -20 -> Clip to 0.
+        # Step 3: Request -20 kW (Discharge). Last was +1. Limit is 1.
+        # Can go down to 0. (Delta -1).
         
         action_discharge = np.array([-20, 0, 0, -20, 0, 0], dtype=np.float32)
         self.env.step(action_discharge)

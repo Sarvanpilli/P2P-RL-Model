@@ -36,7 +36,7 @@ def train_ablation(n_agents, total_timesteps, enable_safety, enable_p2p):
     def make_env():
         env = EnergyMarketEnvSLIM(
             n_agents=n_agents,
-            data_file="processed_hybrid_data.csv",
+            data_file="fixed_training_data.csv",
             random_start_day=True,
             enable_ramp_rates=True,
             enable_losses=True,

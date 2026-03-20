@@ -6,7 +6,8 @@ class SafetySupervisor:
     """
     Layer 3: Hard Safety Supervisor.
     
-    The Ultimate Authority. Enforces invariats and monitors system health.
+    The Ultimate Authority. Enforces invariants and monitors system health.
+    Supports per-agent heterogeneous battery capacities.
     
     Responsibilities:
     1. Invariant Checks (SoC bounds, Energy Conservation).
@@ -15,12 +16,13 @@ class SafetySupervisor:
     """
     
     def __init__(self, 
-                 battery_capacity_kwh: float,
+                 battery_capacity_kwh=50.0,
                  obs_mean: np.ndarray = None, 
                  obs_std: np.ndarray = None,
                  ood_threshold_std: float = 4.0):
         
-        self.battery_capacity_kwh = float(battery_capacity_kwh)
+        # Support both scalar and per-agent array inputs
+        self.battery_capacity_kwh = np.asarray(battery_capacity_kwh, dtype=np.float64)
         
         # Health Monitor: OOD Detection params
         self.obs_mean = obs_mean
@@ -31,7 +33,7 @@ class SafetySupervisor:
         self.consecutive_violations = 0
         self.max_violations_before_lockout = 5
 
-    def check_hard_constraints(self, state: np.ndarray, action: np.ndarray, dt: float) -> Tuple[bool, str]:
+    def check_hard_constraints(self, state: np.ndarray, action: np.ndarray, dt: float, agent_idx: int = 0) -> Tuple[bool, str]:
         """
         Verifies if the proposed action satisfies physical invariants.
         
@@ -39,6 +41,7 @@ class SafetySupervisor:
             state: [Demand, SoC, PV]
             action: [Battery_kW, Trade_kW, Price]
             dt: Timestep hours
+            agent_idx: Index of the agent (for per-agent capacity lookup)
             
         Returns:
             passed: Bool
@@ -51,6 +54,12 @@ class SafetySupervisor:
         batt_kw = action[0] # (+) Charge, (-) Discharge
         trade_kw = action[1]
         
+        # Get capacity for this agent (scalar or from array)
+        if self.battery_capacity_kwh.ndim == 0:
+            cap = float(self.battery_capacity_kwh)
+        else:
+            cap = float(self.battery_capacity_kwh[agent_idx])
+        
         # Invariant 1: SoC Bounds
         # Predict next SoC
         eff = 0.95 ** 0.5 # Approx sqrt eff
@@ -60,8 +69,8 @@ class SafetySupervisor:
             next_soc = soc + batt_kw * dt / eff # batt_kw is negative
             
         # Tolerance 1e-3
-        if next_soc < -1e-3 or next_soc > self.battery_capacity_kwh + 1e-3:
-            return False, f"SoC Violation: Next {next_soc:.2f} outside [0, {self.battery_capacity_kwh}]"
+        if next_soc < -1e-3 or next_soc > cap + 1e-3:
+            return False, f"SoC Violation: Next {next_soc:.2f} outside [0, {cap}]"
             
         # Invariant 2: Energy Conservation (Local)
         # Power Balance: PV + Discharge + Import = Demand + Charge + Export + Losses
