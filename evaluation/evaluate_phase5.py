@@ -138,7 +138,13 @@ def run_evaluation(mode="RL_Phase5", model_path=None, output_csv="eval_output.cs
             obs, reward, dones, infos = env.step(action)
             info = infos[0]
             
-            # Access underlying environment
+            if t == 0:
+                print(f"\nDEBUG STEP 0 ({mode}):")
+                print(f"  Actions: {action}")
+                print(f"  Info Keys: {list(info.keys())}")
+                print(f"  P2P Volume Step: {info.get('p2p_volume_kwh_step', 'MISSING')}")
+                print(f"  Total Import: {info.get('total_import', 'MISSING')}")
+                print(f"  Reward: {reward}")
             raw_env = env.envs[0]
             nodes = raw_env.nodes
             
@@ -151,7 +157,7 @@ def run_evaluation(mode="RL_Phase5", model_path=None, output_csv="eval_output.cs
             step_metrics["total_reward"] = np.sum(reward)
             step_metrics["soc_mean"] = np.mean([n.soc for n in nodes])
             step_metrics["soc_std"] = np.std([n.soc for n in nodes])
-            step_metrics["p2p_volume"] = info.get("p2p_volume", 0.0)
+            step_metrics["p2p_volume"] = info.get("p2p_volume_kwh_step", 0.0)
             
             # Phase 5 specific metrics
             step_metrics["smoothing_penalty"] = info.get("reward/smoothing_mean", 0.0)
@@ -168,15 +174,32 @@ def run_evaluation(mode="RL_Phase5", model_path=None, output_csv="eval_output.cs
         else:
             # Baseline Loop
             actions = []
-            obs_per_agent = len(obs) // env_base.n_agents
+            
+            # Phase 5 Observation is complex. For Rule-Based baseline, we'll
+            # extract the raw physical values directly from the environment
+            # to ensure the heuristic works as intended.
+            demands, pvs, co2 = env_base._get_current_data()
+            socs = np.array([n.soc for n in env_base.nodes])
+            retail, feed_in = env_base._get_grid_prices()
             
             for i in range(env_base.n_agents):
-                agent_obs = obs[i*obs_per_agent : (i+1)*obs_per_agent]
-                act = agents[i].get_action(agent_obs, t)
+                # Construct a 'physical' observation for the RuleBasedAgent [Dem, SoC, PV, ..., Retail, FeedIn]
+                physical_obs = np.zeros(8)
+                physical_obs[0] = demands[i]
+                physical_obs[1] = socs[i]
+                physical_obs[2] = pvs[i]
+                physical_obs[6] = retail
+                physical_obs[7] = feed_in
+                
+                act = agents[i].get_action(physical_obs, t % 24)
                 actions.append(act)
             
             flat_action = np.array(actions).flatten()
             obs, reward, done, trunc, info = env_base.step(flat_action)
+            
+            # DEBUG: Print first few steps
+            if t < 5:
+                print(f"  Step {t} Baseline: Demand={demands[0]:.2f}, PV={pvs[0]:.2f}, Action={actions[0]}, P2P={info.get('p2p_volume_kwh_step', 0.0):.2f}")
             
             step_metrics["market_price"] = info.get("market_price", 0.0)
             step_metrics["loss_kw"] = info.get("loss_kw", 0.0)
@@ -186,7 +209,7 @@ def run_evaluation(mode="RL_Phase5", model_path=None, output_csv="eval_output.cs
             step_metrics["total_reward"] = np.sum(reward)
             step_metrics["soc_mean"] = np.mean([n.soc for n in env_base.nodes])
             step_metrics["soc_std"] = np.std([n.soc for n in env_base.nodes])
-            step_metrics["p2p_volume"] = info.get("p2p_volume", 0.0)
+            step_metrics["p2p_volume"] = info.get("p2p_volume_kwh_step", 0.0)
             step_metrics["smoothing_penalty"] = 0.0
             step_metrics["grid_penalty"] = 0.0
             
@@ -216,84 +239,201 @@ def run_evaluation(mode="RL_Phase5", model_path=None, output_csv="eval_output.cs
     
     return df
 
+def run_multiseed_evaluation(model_paths, env_config, n_eval_steps=336):
+    """
+    Run evaluation across multiple seeds and compute stats.
+    Args:
+        model_paths: List of paths to .zip models
+        env_config: Dict with env parameters
+        n_eval_steps: Timesteps per seed
+    """
+    seed_results = []
+    metrics_to_track = ['p2p_volume', 'total_import', 'total_reward', 'soc_mean', 'market_price']
+    
+    print(f"\nStarting Multiseed Evaluation ({len(model_paths)} seeds)...")
+    
+    for i, path in enumerate(model_paths):
+        print(f"  Evaluating Seed {i} from: {path}")
+        
+        # Load Env
+        def make_env():
+            return EnergyMarketEnvRobust(**env_config)
+            
+        env_base = make_env()
+        env = DummyVecEnv([lambda: env_base])
+        
+        # Load VecNormalize if exists
+        vec_path = os.path.join(os.path.dirname(path), "vec_normalize.pkl")
+        if os.path.exists(vec_path):
+            env = VecNormalize.load(vec_path, env)
+            env.training = False
+            env.norm_reward = False
+        
+        # Load Model
+        model = PPO.load(path, env=env)
+        
+        # Eval Loop (simplified for speed/stats)
+        obs = env.reset()
+        episode_metrics = {m: [] for m in metrics_to_track}
+        
+        for t in range(n_eval_steps):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, infos = env.step(action)
+            info = infos[0]
+            
+            if i == 0 and t < 5:
+                print(f"  [DEBUG Seed 0 Step {t}] Action={action[0]}, P2P={info.get('p2p_volume_kwh_step', 0.0):.4f}, Import={info.get('total_import', 0.0):.4f}")
+            
+            episode_metrics['p2p_volume'].append(info.get('p2p_volume_kwh_step', 0.0))
+            episode_metrics['total_import'].append(info.get('total_import', 0.0))
+            episode_metrics['total_reward'].append(np.sum(reward))
+            episode_metrics['soc_mean'].append(np.mean([n.soc for n in env.envs[0].nodes]))
+            episode_metrics['market_price'].append(info.get('market_price', 0.0))
+            
+        # Compute Episode Totals/Means for this seed
+        seed_summary = {
+            'p2p_volume':   np.sum(episode_metrics['p2p_volume']),
+            'total_import':  np.sum(episode_metrics['total_import']),
+            'total_reward': np.mean(episode_metrics['total_reward']), # mean per step
+            'soc_mean':     np.mean(episode_metrics['soc_mean']),
+            'market_price': np.mean(episode_metrics['market_price'])
+        }
+        seed_results.append(seed_summary)
+        print(f"    Seed {i} Result: Reward={seed_summary['total_reward']:.2f}, P2P={seed_summary['p2p_volume']:.2f}")
+
+    # Compute Aggregate Stats
+    final_stats = {}
+    n_seeds = len(seed_results)
+    
+    for metric in seed_results[0].keys():
+        values = [res[metric] for res in seed_results]
+        mean = np.mean(values)
+        std = np.std(values, ddof=1) if n_seeds > 1 else 0.0
+        ci_95 = 1.96 * (std / np.sqrt(n_seeds)) if n_seeds > 1 else 0.0
+        
+        final_stats[metric] = {
+            'mean': float(mean),
+            'std': float(std),
+            'ci_low': float(mean - ci_95),
+            'ci_high': float(mean + ci_95)
+        }
+
+    # Print Formatted Table
+    print("\n" + "┌" + "─"*21 + "┬" + "─"*14 + "┬" + "─"*14 + "┬" + "─"*14 + "┐")
+    print("│ Metric              │ Mean         │ Std Dev      │ 95% CI       │")
+    print("├" + "─"*21 + "┼" + "─"*14 + "┼" + "─"*14 + "┼" + "─"*14 + "┤")
+    
+    labels = {
+        'p2p_volume': 'P2P Volume (kWh)',
+        'total_import': 'Grid Import (kWh)',
+        'total_reward': 'Total Reward',
+        'soc_mean': 'Mean SoC (%)',
+        'market_price': 'Market Price ($/kWh)'
+    }
+    
+    for m, label in labels.items():
+        s = final_stats[m]
+        print(f"│ {label:<20}│ {s['mean']:<13.2f}│ ± {s['std']:<11.2f}│ [{s['ci_low']:<5.2f}, {s['ci_high']:<5.2f}] │")
+        
+    print("└" + "─"*21 + "┴" + "─"*14 + "┴" + "─"*14 + "┴" + "─"*14 + "┘")
+    print(f"95% CI = mean ± 1.96 * (std / sqrt({n_seeds}))")
+    
+    return final_stats
+
+def compare_models_multiseed(baseline_paths, auction_paths, slim_paths, env_config):
+    """Compare three model architectures across seeds."""
+    from datetime import datetime
+    
+    all_results = {}
+    models = {
+        "baseline": baseline_paths,
+        "legacy_auction": auction_paths,
+        "slim": slim_paths
+    }
+    
+    for name, paths in models.items():
+        if paths and len(paths) > 0:
+            print(f"\nEvaluating Model Group: {name}")
+            all_results[name] = run_multiseed_evaluation(paths, env_config)
+    
+    # Print Comparison Table
+    print("\n" + "┌" + "─"*21 + "┬" + "─"*18 + "┬" + "─"*18 + "┬" + "─"*18 + "┐")
+    print("│ Metric              │ Baseline         │ Legacy Auction   │ SLIM (Ours)      │")
+    print("├" + "─"*21 + "┼" + "─"*18 + "┼" + "─"*18 + "┼" + "─"*18 + "┤")
+    
+    metrics = ['p2p_volume', 'total_import']
+    labels = {'p2p_volume': 'P2P Volume (kWh)', 'total_import': 'Grid Import (kWh)'}
+    
+    for m in metrics:
+        row = f"│ {labels[m]:<20}│"
+        for name in ["baseline", "legacy_auction", "slim"]:
+            if name in all_results:
+                s = all_results[name][m]
+                row += f" {s['mean']:>7.2f} ± {s['std']:<7.2f}│"
+            else:
+                row += f" {'N/A':<17}│"
+        print(row)
+        
+    print("└" + "─"*21 + "┴" + "─"*18 + "┴" + "─"*18 + "┴" + "─"*18 + "┘")
+    
+    # Save to JSON
+    import json
+    save_data = {
+        **all_results,
+        "n_seeds": len(slim_paths) if slim_paths else 0,
+        "timestamp": datetime.now().isoformat()
+    }
+    os.makedirs("evaluation/results", exist_ok=True)
+    with open("evaluation/results/multiseed_results.json", 'w') as f:
+        json.dump(save_data, f, indent=2)
+    print("\nResults saved to evaluation/results/multiseed_results.json")
+
 
 def main():
-    """Run comprehensive evaluation"""
+    """Run comprehensive evaluation including multiseed analysis"""
     
-    # Check for Phase 5 model checkpoints
+    # 1. Individual Checkpoint Evaluation (Original Logic)
     phase5_dir = "models_phase5_hybrid"
-    
-    # Find latest checkpoint
     checkpoints = [
-        ("50k", "ppo_hybrid_50000_steps.zip"),
-        ("100k", "ppo_hybrid_100000_steps.zip"),
-        ("150k", "ppo_hybrid_150000_steps.zip"),
-        ("200k", "ppo_hybrid_200000_steps.zip"),
         ("250k", "ppo_hybrid_250016_steps.zip"),
     ]
     
-    results_summary = []
-    
-    # Evaluate each checkpoint
     for name, checkpoint in checkpoints:
         model_path = os.path.join(phase5_dir, checkpoint)
         if os.path.exists(model_path):
-            print(f"\n{'#'*60}")
-            print(f"# Evaluating Checkpoint: {name}")
-            print(f"{'#'*60}")
-            
-            output_csv = f"evaluation/results_phase5_{name}.csv"
-            df = run_evaluation(
-                mode=f"RL_Phase5_{name}",
-                model_path=model_path,
-                output_csv=output_csv,
-                n_steps=168  # 1 week
-            )
-            
-            if df is not None:
-                results_summary.append({
-                    "checkpoint": name,
-                    "mean_reward": df['total_reward'].mean(),
-                    "total_import": df['total_import'].sum(),
-                    "total_export": df['total_export'].sum(),
-                    "mean_soc": df['soc_mean'].mean(),
-                    "p2p_volume": df['p2p_volume'].sum()
-                })
-        else:
-            print(f"Checkpoint not found: {model_path}")
+            run_evaluation(mode=f"RL_Phase5_{name}", model_path=model_path, 
+                           output_csv=f"evaluation/results_phase5_{name}.csv", n_steps=168)
     
-    # Evaluate baseline
+    # 2. PROMPT 3: MULTISEED EVALUATION
     print(f"\n{'#'*60}")
-    print(f"# Evaluating Baseline")
+    print(f"# RUNNING MULTISEED COMPARISON (PROMPT 3)")
     print(f"{'#'*60}")
     
-    df_baseline = run_evaluation(
-        mode="Baseline",
-        model_path=None,
-        output_csv="evaluation/results_phase5_baseline.csv",
-        n_steps=168
-    )
+    env_config = {
+        "n_agents": 4,
+        "data_file": "evaluation/ausgrid_p2p_energy_dataset.csv",
+        "random_start_day": False,
+        "enable_ramp_rates": True,
+        "enable_losses": True,
+        "forecast_horizon": 4,
+        "enable_predictive_obs": True,
+        "diversity_mode": True
+    }
     
-    if df_baseline is not None:
-        results_summary.append({
-            "checkpoint": "Baseline",
-            "mean_reward": df_baseline['total_reward'].mean(),
-            "total_import": df_baseline['total_import'].sum(),
-            "total_export": df_baseline['total_export'].sum(),
-            "mean_soc": df_baseline['soc_mean'].mean(),
-            "p2p_volume": df_baseline['p2p_volume'].sum()
-        })
+    slim_seeds = [f"models_slim/seed_{i}/best_model.zip" for i in range(5)]
+    slim_paths = [p for p in slim_seeds if os.path.exists(p)]
     
-    # Save summary
-    summary_df = pd.DataFrame(results_summary)
-    summary_df.to_csv("evaluation/phase5_evaluation_summary.csv", index=False)
-    
-    print(f"\n{'='*60}")
-    print(f"EVALUATION SUMMARY")
-    print(f"{'='*60}")
-    print(summary_df.to_string(index=False))
-    print(f"{'='*60}\n")
-
+    if len(slim_paths) > 0:
+        # Run multiseed comparison
+        # (We use empty lists for baseline/legacy if not available to at least get SLIM stats)
+        compare_models_multiseed(
+            baseline_paths=[], # Rule-based is handled separately or can be added
+            auction_paths=[], 
+            slim_paths=slim_paths,
+            env_config=env_config
+        )
+    else:
+        print("ERROR: No multiseed checkpoints found in models_slim/")
 
 if __name__ == "__main__":
     main()

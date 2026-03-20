@@ -148,7 +148,7 @@ st.divider()
 st.header("📌 Final Conclusions")
 st.success("""
 1.  **Superior Coordination**: The SLIM framework outperformed the legacy auction by **42% in P2P volume**, utilizing Graph Neural Networks to match energy surplus efficiently.
-2.  **Verified Safety**: Integrated **Lagrangian Safety Layers** ensured 0% battery violations, crucial for real-world hardware longevity.
+2.  **Verified Safety**: Integrated **Projection-Based Safety Constraints** ensured 0% battery violations, crucial for real-world hardware longevity.
 3.  **Positive Scaling**: Scalability tests confirm that the model's benefits grow with the community size, proving the framework's robustness for future smart cities.
 """)
 

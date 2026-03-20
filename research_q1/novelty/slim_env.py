@@ -66,9 +66,16 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             # Old naive auction mechanism (mid-price calculation)
             self.liquidity_pool = DynamicMarketMechanism(base_delta=0.0)
             
-        # Override observation space to account for +4 market features per agent
-        # Base (7) + Market (4) = 11 base features + 2 weather + 4 type + 8 forecast + 1 peer = 26 features
-        obs_features = 26
+        # Logic: Base (7) + Market (4) = 11 base features + 2 weather + 4 type + (2 * H) forecast + 1 peer
+        n_base = 7
+        n_market = 4
+        n_total_base = n_base + n_market
+        n_weather = 2
+        n_type = 4
+        n_forecast = 2 * self.forecast_horizon
+        n_peer = 1
+        
+        obs_features = n_total_base + n_weather + n_type + n_forecast + n_peer
         self.observation_space = spaces.Box(
             low=-1.0,
             high=1.0,

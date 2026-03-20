@@ -8,16 +8,30 @@ from train.safety_filter import FeasibilityFilter
 
 class AutonomousGuard:
     """
-    The Central Nervous System of the Autonomous Controller.
-    
-    Implements the 3-Layer Architecture:
-    1. Layer 1 (Input): Strategic RL Intent.
-    2. Layer 2 (Process): Deterministic Optimization (via FeasibilityFilter).
-    3. Layer 3 (Verify): Hard Safety Supervisor & Health Monitor.
-    
-    Also handles:
-    - Tracing/Logging
-    - OOD Detection -> Fallback
+    AutonomousGuard: 3-Layer Projection-Based Safety Controller.
+
+    Architecture:
+        Layer 1 — Jitter Clipping: rate-limits action changes via slew bounds.
+        Layer 2 — FeasibilityFilter: projects actions onto the physically feasible set.
+                  Enforces SoC bounds, surplus-limited trading, and price validity.
+        Layer 3 — SafetySupervisor: hard veto with zero-action fallback.
+
+    Role in the hybrid safety system:
+        This guard provides GUARANTEED constraint satisfaction at every timestep
+        via deterministic projection. It operates as the hard backstop.
+
+        The LagrangianSafetyLayer (train/lagrangian_safety.py) operates in parallel
+        as a SOFT constraint teacher — it shapes the reward signal so the POLICY
+        itself learns to avoid constraint boundaries, reducing how often this guard
+        needs to intervene. Together they form a two-tier safety system:
+            - Lagrangian: teaches the agent where the boundary is (learning signal)
+            - AutonomousGuard: enforces the boundary if the agent crosses it (hard guarantee)
+
+    Statistics tracked:
+        guard_info['layer1_interventions']: times jitter clip fired
+        guard_info['layer2_interventions']: times feasibility filter changed action
+        guard_info['layer3_vetoes']:        times action was fully vetoed
+        guard_info['constraint_violation_rate']: layer3_vetoes / total_steps
     """
     
     def __init__(self, 
@@ -69,6 +83,12 @@ class AutonomousGuard:
         self.timestep_hours = timestep_hours
 
         self.prev_actions = np.zeros((n_agents, 3)) # For Jitter Clipping
+        
+        # --- Option A Compliance: Constraint Stats ---
+        self.total_steps = 0
+        self.layer1_interventions = 0
+        self.layer2_interventions = 0
+        self.layer3_vetoes = 0
         
     def reset(self):
         """Resets internal state."""
@@ -147,17 +167,25 @@ class AutonomousGuard:
         if not np.allclose(rl_actions_clipped, rl_actions_reshaped, atol=1e-3):
              guard_info["jitter_events"] += 1
 
+        # --- Option A Stats Increment ---
+        self.total_steps += 1
+        if guard_info["jitter_events"] > 0:
+            self.layer1_interventions += 1
+        
         # Calculate mask
         mask_fallback = np.zeros(self.n_agents, dtype=bool)
         
         # 2. Optimization (Layer 2)
         # Run filter on CLIPPED intentions
-        optimized_actions, _ = self.optimizer.filter_action(
+        optimized_actions, changed_l2 = self.optimizer.filter_action(
             rl_actions_clipped, state
         )
+        if changed_l2:
+            self.layer2_interventions += 1
         
         # 3. Hard Safety Check (Layer 3) & Final Selection
         final_actions = np.zeros_like(rl_actions_reshaped)
+        step_has_veto = False
         
         for i in range(self.n_agents):
             intent = rl_actions_reshaped[i] # Log original intent
@@ -175,6 +203,7 @@ class AutonomousGuard:
                 final_act = self.supervisor.get_fallback_action()
                 guard_info["safety_violations"] += 1
                 guard_info["fallback_triggered"] += 1
+                step_has_veto = True
             else:
                 # All Good
                 status = "OPTIMIZED"
@@ -194,10 +223,26 @@ class AutonomousGuard:
                 metrics={"reason": reason if not is_safe else "OK"}
             )
         
+        if step_has_veto:
+            self.layer3_vetoes += 1
+
         # Update state persistence
         self.prev_actions = final_actions.copy()
             
         return final_actions.flatten(), guard_info
+
+    def get_constraint_stats(self) -> Dict[str, Any]:
+        """
+        Returns cumulative safety intervention statistics.
+        """
+        violation_rate = self.layer3_vetoes / self.total_steps if self.total_steps > 0 else 0.0
+        return {
+          'total_steps': int(self.total_steps),
+          'layer1_interventions': int(self.layer1_interventions),
+          'layer2_interventions': int(self.layer2_interventions),
+          'layer3_vetoes': int(self.layer3_vetoes),
+          'constraint_violation_rate': float(violation_rate)
+        }
 
     def load_obs_stats(self, mean: np.ndarray, std: np.ndarray):
         """Loads training statistics for OOD detection."""

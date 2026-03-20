@@ -63,7 +63,7 @@ class EnergyMarketEnvRobust(gym.Env):
         # Physics Constants
         self.max_line_capacity_kw = 50.0
         self.line_resistance_ohms = 0.05 # Assumption
-        self.overload_multiplier = 10.0 # Penalty weight
+        self.overload_multiplier = 5.0 # Penalty weight (Rebalanced)
 
         self._load_data()
         
@@ -85,6 +85,19 @@ class EnergyMarketEnvRobust(gym.Env):
         )
         
         self.reward_tracker = RewardTracker(n_agents)
+        
+        # Lagrangian safety layer (soft constraints — complements hard clipping)
+        from train.lagrangian_safety import LagrangianSafetyLayer
+        self.lagrangian = LagrangianSafetyLayer(
+            n_agents=self.n_agents,
+            alpha=0.005,
+            threshold_soc_violation=0.01,
+            threshold_line_violation=0.05,
+            threshold_voltage_violation=0.03,
+            max_lambda=10.0,
+            lambda_init=0.1,
+        )
+        self.max_line_capacity_kw = getattr(self, 'max_line_capacity_kw', 50.0)
         
         # Spaces
         # heterogeneous physical bounds for each agent
@@ -133,20 +146,26 @@ class EnergyMarketEnvRobust(gym.Env):
         # Track prev action for smoothing
         self.prev_actions = np.zeros((n_agents, 3))
         
+        # Cumulative metrics for evaluation
+        self.total_grid_import = 0.0
+        self.total_grid_export = 0.0
+        self.total_p2p_volume = 0.0
+        
         self.rng = np.random.default_rng()
         
     def _setup_agents(self):
         self.nodes = []
         for i in range(self.n_agents):
-            if i == 0:
+            agent_type = i % 4
+            if agent_type == 0:
                 # Agent 0: Solar (5kWh)
                 node = MicrogridNode(node_id=i, battery_capacity_kwh=5.0, battery_max_charge_kw=2.5, battery_eff=0.9)
                 node.agent_type_id = 0 # Solar
-            elif i == 1:
+            elif agent_type == 1:
                 # Agent 1: Wind (5kWh)
                 node = MicrogridNode(node_id=i, battery_capacity_kwh=5.0, battery_max_charge_kw=2.5, battery_eff=0.9)
                 node.agent_type_id = 1 # Wind
-            elif i == 2:
+            elif agent_type == 2:
                 # Agent 2: EV-V2G (62kWh / 2kWh)
                 # Max capacity is 62. We constrain it dynamically.
                 node = MicrogridNode(node_id=i, battery_capacity_kwh=62.0, battery_max_charge_kw=7.0, battery_eff=0.9) 
@@ -172,34 +191,19 @@ class EnergyMarketEnvRobust(gym.Env):
         pass
 
     def _apply_ev_constraints(self):
-        """Phase 5: Dynamic logic for Agent 2 EV."""
+        """Phase 5: Dynamic logic for EV agents."""
         hour = (self.current_idx % 24)
-        ev_node = self.nodes[2]
-        
-        # Day: 08:00 - 17:00 (Hours 8 to 17 non-inclusive? usually 8<=h<=17)
-        # "2kWh during day 08:00-17:00"
-        if 8 <= hour < 17:
-             # EV is Away or Reserved.
-             # Effective Capacity = 2.0 kWh
-             # We should clamp current SOC if it's above 2.0? 
-             # Or just limit usable capacity?
-             # Realistic: Car departs at 8am with high charge. Returns at 5pm?
-             # User says: "Capacity... 2kWh during day". 
-             # This implies it's connected but only 2kWh buffer accessible?
-             # Or it physically changes.
-             # Let's set the effective capacity limit in the node.
-             ev_node.battery_capacity_kwh = 2.0
-             # If current SOC > 2.0, well, physically the energy is there but inaccessible.
-             # But RL sees SOC. 
-             # Let's assume SOC is capped at 2.0 for interaction.
-             if ev_node.soc > 2.0:
-                 ev_node.soc = 2.0 # Force draining (or hiding)
-        else:
-             # Night: 62kWh
-             if ev_node.battery_capacity_kwh < 62.0:
-                 ev_node.battery_capacity_kwh = 62.0
-                 # SOC returns? 
-                 # Complex dynamics. Let's assume it stays at last value.
+        for node in self.nodes:
+            if node.agent_type_id == 2:
+                # Day: 08:00 - 17:00
+                if 8 <= hour < 17:
+                     node.battery_capacity_kwh = 2.0
+                     if node.soc > 2.0:
+                         node.soc = 2.0
+                else:
+                     # Night: 62kWh
+                     if node.battery_capacity_kwh < 62.0:
+                         node.battery_capacity_kwh = 62.0
 
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, Dict]:
@@ -230,6 +234,11 @@ class EnergyMarketEnvRobust(gym.Env):
         self.history_buffer['pv'].fill(0.0)
         self.prev_actions.fill(0.0) # Unified Plural
         
+        # Reset Cumulative Metrics
+        self.total_grid_import = 0.0
+        self.total_grid_export = 0.0
+        self.total_p2p_volume = 0.0
+        
         # Pre-fill history?
         # Ideally we loop back 4 steps. For now, zero padding is okay or we can read back.
         # Let's read back for correctness if possible.
@@ -240,7 +249,10 @@ class EnergyMarketEnvRobust(gym.Env):
                  for i in range(self.n_agents):
                     self.history_buffer['demand'][i, k] = row.get(f"agent_{i}_demand_kw", 0.0)
                     self.history_buffer['pv'][i, k] = row.get(f"agent_{i}_pv_kw", 0.0)
-
+        
+        # End-of-episode lambda update (must happen before state reset)
+        if hasattr(self, 'lagrangian'):
+            self.lagrangian.end_episode_update()
             
         self.reward_tracker.reset()
         self.guard.reset()
@@ -263,20 +275,20 @@ class EnergyMarketEnvRobust(gym.Env):
         gens = []
         
         # Agent 0: Solar, Demand
-        dems.append(row.get('agent_0_demand', 0.0))
-        gens.append(row.get('agent_0_pv', 0.0))
+        dems.append(row.get('agent_0_demand', row.get('agent_0_demand_kw', 0.0)))
+        gens.append(row.get('agent_0_pv', row.get('agent_0_pv_kw', 0.0)))
         
-        # Agent 1: Wind, Demand
-        dems.append(row.get('agent_1_demand', 0.0))
-        gens.append(row.get('agent_1_wind', 0.0)) # Wind!
+        # Agent 1: Wind/Solar, Demand
+        dems.append(row.get('agent_1_demand', row.get('agent_1_demand_kw', 0.0)))
+        gens.append(row.get('agent_1_wind', row.get('agent_1_pv_kw', row.get('agent_1_pv', 0.0))))
         
-        # Agent 2: EV, Demand (PV?)
-        dems.append(row.get('agent_2_demand', 0.0))
-        gens.append(row.get('agent_2_pv', 0.0)) # Does EV have PV? Maybe home PV.
+        # Agent 2: EV, Demand
+        dems.append(row.get('agent_2_demand', row.get('agent_2_demand_kw', 0.0)))
+        gens.append(row.get('agent_2_pv', row.get('agent_2_pv_kw', 0.0)))
         
         # Agent 3: Standard
-        dems.append(row.get('agent_3_demand', 0.0))
-        gens.append(row.get('agent_3_pv', 0.0))
+        dems.append(row.get('agent_3_demand', row.get('agent_3_demand_kw', 0.0)))
+        gens.append(row.get('agent_3_pv', row.get('agent_3_pv_kw', 0.0)))
         
         # Weather
         temp = row.get('temperature_2m', 20.0)
@@ -341,7 +353,7 @@ class EnergyMarketEnvRobust(gym.Env):
         return {
             'demands': demands,
             'pvs': pvs,
-            'co2': co2,
+            'co2': co2[0] if isinstance(co2, np.ndarray) else co2, # Use temp or scalar
             'safe_action': safe_action, # Filtered action
             'node_results': node_results,
             'guard_info': guard_info
@@ -448,82 +460,168 @@ class EnergyMarketEnvRobust(gym.Env):
         }
 
     def _step_grid_and_reward(self, physics_state, market_results):
-        trades = market_results['trades']
+        trades = market_results['trades'] # Net exchange (P2P + Grid)
         market_price = market_results['market_price']
-        co2 = physics_state['co2']
+        co2 = physics_state['co2'] # Carbon intensity
         node_results = physics_state['node_results']
+        safe_action = physics_state['safe_action']
         
-        # Grid Impact
-        intended_injection = trades
-        total_export = np.sum(np.clip(intended_injection, 0, None))
-        total_import = np.sum(np.abs(np.clip(intended_injection, None, 0)))
+        # 1. Economic Coefficients (Rebalanced Task)
+        # Grid penalty is capped at 0.15 to stay below the P2P profit margin of $0.10–0.40/kWh.
+        GRID_PENAL_COEFF = 0.15
+        SMOOTHING_COEFF = 0.05
+        CO2_PENAL_COEFF = 0.10
+        P2P_BONUS_COEFF = 0.20
+        # self.overload_multiplier (already set to 5.0 in __init__)
+
+        # 2. Grid & P2P Analysis
+        # Ground Truth: Each agent's net physical requirement
+        # node_results is a list of dicts from MicrogridNode.step()
+        phys_net_load = np.array([res['net_load_kw'] for res in node_results])
         
-        # Overloads
+        # P2P matched volume comes from the matching engine (cleared between agents)
+        # We need to extract the P2P portion of the trades.
+        # market_results['match_info']['total_volume'] is the aggregate P2P volume.
+        total_p2p_volume = market_results.get('match_info', {}).get('total_volume', 0.0)
+        
+        # Determine each agent's p2p_trade (part of their net_load satisfied by P2P)
+        # In a pro-rata uniform auction, we can derive this from market_results['trades']
+        # which already contains [P2P + Bidded_Grid].
+        # But it's safer to just allocate total_p2p_volume based on the matching engine's logic.
+        
+        p2p_agent_trades = np.zeros(self.n_agents)
+        # trades_market = market_results['trades'] # This only includes bidded volume
+        
+        # For simplicity and correctness: 
+        # Actual Grid Trade = Physical_Net_Load - (successful P2P trades)
+        # We'll use the matching engine's P2P volume to ensure consistency
+        
+        # Identify who actually traded P2P (those who bid and were matched)
+        # The matching engine 'trades' result includes both P2P and Grid-as-Backstop.
+        # total_export_bidded = sum of positive market trades
+        # total_import_bidded = sum of absolute negative market trades
+        total_exp_b = np.sum(np.clip(trades, 0, None))
+        total_imp_b = np.sum(np.abs(np.clip(trades, None, 0)))
+        
+        for i in range(self.n_agents):
+            if trades[i] > 0: # Seller in market
+                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_exp_b if total_exp_b > 0 else 0)
+            else: # Buyer in market
+                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_imp_b if total_imp_b > 0 else 0)
+        
+        # The ACTUAL energy exchange with the grid for agent i is:
+        # grid_trade[i] = physical_net_load[i] - p2p_agent_trades[i]
+        # BUT wait: net_load is (Dem - PV + Batt). P2P trade is positive for sell, negative for buy.
+        # If net_load is -1.0 (surplus) and p2p_trade is 0.2 (sell), grid_export = 0.8.
+        # If net_load is 1.0 (deficit) and p2p_trade is -0.3 (buy), grid_import = 0.7.
+        # Formula: actual_grid_flow[i] = -phys_net_load[i] + p2p_agent_trades[i] 
+        # (Using Matching Engine sign convention: + is export, - is import)
+        
+        actual_grid_flow = -phys_net_load + p2p_agent_trades
+        
+        total_export = np.sum(np.clip(actual_grid_flow, 0, None))
+        total_import = np.sum(np.abs(np.clip(actual_grid_flow, None, 0)))
+        
+        # Update metrics for info
+        self.total_grid_import += total_import
+        self.total_grid_export += total_export
+        self.total_p2p_volume += total_p2p_volume
+
+        # 3. Component Calculations
+        # 3a. Grid Import Penalty
+        grid_import_kw = np.maximum(0.0, -actual_grid_flow)
+        grid_import_penalty = grid_import_kw * GRID_PENAL_COEFF
+        
+        # 3b. Action Smoothing Penalty
+        # Applied to all 3 action components for stability
+        action_diffs = np.abs(safe_action - self.prev_actions)
+        smoothing_penalty = np.sum(action_diffs, axis=1) * SMOOTHING_COEFF
+        
+        # 3c. CO2 Penalty (based on grid import)
+        # kg_co2 = grid_import_kwh * co2_intensity
+        grid_import_kwh = grid_import_kw * self.timestep_hours
+        co2_penalty = (grid_import_kwh * co2) * CO2_PENAL_COEFF
+        
+        # 3d. P2P Trading Bonus (+0.20 per kWh)
+        p2p_bonus = np.abs(p2p_agent_trades) * P2P_BONUS_COEFF
+        
+        # 3e. Overload Penalties
         line_overload_kw = max(0.0, max(total_export, total_import) - self.max_line_capacity_kw)
+        overload_penalty_agent = np.ones(self.n_agents) * line_overload_kw * self.overload_multiplier / self.n_agents
         
-        # Phase 2: Distribution Losses (I^2 * R)
-        loss_kw = 0.0
-        if self.enable_losses:
-            # Estimate total network flow (sum of absolute net loads)
-            # This represents the total "traffic" on the microgrid lines
-            net_loads = np.array([r['net_load_kw'] for r in node_results])
-            total_abs_flow_kw = np.sum(np.abs(net_loads))
-            
-            # Current I = P / V (kW / kV = Amps)
-            total_current_amps = total_abs_flow_kw / self.grid_voltage_kv
-            
-            # Total Loss = I^2 * R (Watts) -> /1000 for kW
-            # Simplifying assumption: Lumped resistance for the whole network? 
-            # Or R per agent? If R is "effective resistance of the grid seen by aggregate"
-            loss_kw = (total_current_amps ** 2) * self.line_resistance_ohms / 1000.0
-        
-        
-        # Carbon logging: energy imported (kWh) * intensity (kg/kWh) = kg CO2
-        # total_import is power (kW); convert to energy for the step
-        # kept for info logging only
-        import_kwh = total_import * self.timestep_hours
-        step_carbon_mass = import_kwh * co2  # kg
-        
-        # Rewards
+        # 3f. Operational Penalties (SoC and Battery Wear)
         socs_final = np.array([r['soc'] for r in node_results])
         throughputs = np.array([r['throughput_delta'] for r in node_results])
+        soc_penalty = (socs_final - 50.0)**2 * 0.001
+        battery_wear_cost = throughputs * 0.05
         
-        # Grid Import Penalty (Target: minimize grid dependence)
-        # Import is negative in 'trades'. So max(0, -trade) gives import kW.
-        # Weighting: 0.5 per kW imported? Or higher?
-        # If profit is ~0.10, then 0.50 penalty is strong.
-        grid_import_kw = np.maximum(0.0, -trades)
-        grid_import_penalty = grid_import_kw * 0.5 
-
+        # 4. Final Aggregation
         reward = self.reward_tracker.calculate_total_reward(
-            profits=trades * market_price, # Revenue
-            grid_import_penalties=grid_import_penalty, # Base import penalty
-            soc_penalties=(socs_final - 50.0)**2 * 0.001, 
-            grid_overload_costs=np.ones(self.n_agents) * line_overload_kw * self.overload_multiplier / self.n_agents,
-            battery_costs=throughputs * 0.05,
+            profits=trades * market_price,
+            grid_import_penalties=grid_import_penalty,
+            soc_penalties=soc_penalty,
+            grid_overload_costs=overload_penalty_agent,
+            battery_costs=battery_wear_cost,
+            smoothing_penalties=smoothing_penalty,
+            co2_penalties=co2_penalty,
+            p2p_bonuses=p2p_bonus,
             total_export_kw=total_export
         )
         
-        self.prev_actions = physics_state['safe_action'].copy()
+        # --- LAGRANGIAN SAFETY PENALTY ---
+        # Get current SoC values for all agents
+        current_socs = np.array([node.soc for node in self.nodes])
+        battery_caps = np.array([node.battery_capacity_kwh for node in self.nodes])
+
+        # Total absolute network flow
+        total_abs_flow_kw = max(total_export, total_import)
+        
+        lagrangian_violations = self.lagrangian.compute_violations(
+            soc_values=current_socs,
+            battery_capacities=battery_caps,
+            line_flow_kw=total_abs_flow_kw,
+            max_line_capacity_kw=self.max_line_capacity_kw,
+            grid_voltage_kv=getattr(self, 'grid_voltage_kv', 0.4),
+            line_resistance_ohm=getattr(self, 'line_resistance_ohms', 0.01),
+        )
+        lagrangian_penalty = self.lagrangian.compute_penalty(lagrangian_violations)
+        self.lagrangian.record_step(lagrangian_violations)
+
+        # Subtract Lagrangian penalty from total reward
+        reward = reward - lagrangian_penalty
+
+        # Add to info dict for TensorBoard logging (will be updated below)
+        # --- END LAGRANGIAN ---
+        
+        # 5. Logging and Info Update
+        profit_breakdown = self.reward_tracker.get_profit_breakdown()
+        
+        # absolute_profit_usd: real-world USD balance
+        # gross_profit + bonuses - all penalty terms
+        absolute_profit_usd = profit_breakdown['gross_profit'] + np.sum(p2p_bonus) - profit_breakdown['total_penalties']
+
+        self.prev_actions = safe_action.copy()
         r_info = self.reward_tracker.get_info()
         
-        # Per-agent trade (kW): positive = export, negative = import
-        trades_kw = trades.copy()
-        throughput_deltas = np.array([r["throughput_delta"] for r in node_results])
         info = {
             "market_price": market_price,
-            "loss_kw": loss_kw, # Now calculated
             "total_export": total_export,
             "total_import": total_import,
-            "total_carbon_mass": step_carbon_mass,
             "grid_capacity_limit": self.max_line_capacity_kw,
-            "trades_kw": trades_kw,
-            "battery_throughput_delta_kwh": throughput_deltas,
             "line_overload_kw": line_overload_kw,
+            "p2p_volume_kwh_step": total_p2p_volume * self.timestep_hours,
+            "absolute_profit_usd": absolute_profit_usd,
+            "profit_breakdown": profit_breakdown,
             **r_info,
             **physics_state["guard_info"],
             "failed_trades": market_results.get('failed_trades_count', 0),
-            "bid_prices_mean": np.mean(market_results.get('bid_prices', np.zeros(self.n_agents)))
+            
+            # Lagrangian Stats
+            **self.lagrangian.get_lambda_info(),
+            'lagrangian/violation_soc':     float(lagrangian_violations[0]),
+            'lagrangian/violation_line':    float(lagrangian_violations[1]),
+            'lagrangian/violation_voltage': float(lagrangian_violations[2]),
+            'lagrangian/penalty_this_step': lagrangian_penalty
         }
         
         obs = self._get_obs(total_export, total_import)

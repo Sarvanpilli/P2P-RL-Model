@@ -191,7 +191,7 @@ class CTDEGNNPolicy(ActorCriticPolicy):
         batch_size = observation.shape[0]
         mean_actions = self.actor_net(node_emb).view(batch_size, -1)
         
-        if deterministic:v 
+        if deterministic:
             return mean_actions
             
         action_std = torch.exp(self.log_std).expand_as(mean_actions)
