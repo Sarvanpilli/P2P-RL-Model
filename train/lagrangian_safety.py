@@ -56,15 +56,19 @@ class LagrangianSafetyLayer:
     def __init__(
         self,
         n_agents: int = 4,
-        alpha: float = 0.005,          # dual learning rate
-        threshold_soc_violation: float = 0.01,   # allow 1% avg SoC violation
-        threshold_line_violation: float = 0.05,  # allow 5% line capacity overage
-        threshold_voltage_violation: float = 0.03, # allow 3% voltage deviation
-        max_lambda: float = 10.0,      # cap lambdas to prevent explosion
-        lambda_init: float = 0.1,      # warm start (not zero, avoids cold start)
+        alpha: float = 0.005,           # PID Proportional gain (was: dual learning rate)
+        alpha_i: float = 0.001,         # Improvement 3: PID Integral gain
+        alpha_d: float = 0.002,         # Improvement 3: PID Derivative gain
+        threshold_soc_violation: float = 0.01,
+        threshold_line_violation: float = 0.05,
+        threshold_voltage_violation: float = 0.03,
+        max_lambda: float = 10.0,
+        lambda_init: float = 0.1,
     ):
         self.n_agents = n_agents
-        self.alpha = alpha
+        self.alpha = alpha          # Proportional
+        self.alpha_i = alpha_i      # Integral
+        self.alpha_d = alpha_d      # Derivative
         self.thresholds = np.array([
             threshold_soc_violation,
             threshold_line_violation,
@@ -73,17 +77,21 @@ class LagrangianSafetyLayer:
         self.max_lambda = max_lambda
 
         # Lagrange multipliers — one per constraint
-        # Shape: (3,) → [lambda_soc, lambda_line, lambda_voltage]
         self.lambdas = np.full(3, lambda_init, dtype=np.float32)
 
+        # Improvement 3: PID state variables
+        self._integral = np.zeros(3, dtype=np.float32)    # accumulated error
+        self._prev_error = np.zeros(3, dtype=np.float32)  # last episode error
+        self._integral_max = 5.0   # cap integral term to prevent windup
+
         # Episode-level accumulators (reset each episode)
-        self._episode_violations = []   # list of (3,) arrays per step
+        self._episode_violations = []
         self._step_count = 0
 
         # Lifetime statistics
         self.total_steps = 0
         self.total_episodes = 0
-        self.lambda_history = []        # list of (3,) arrays, one per episode end
+        self.lambda_history = []
 
     def compute_violations(
         self,
@@ -159,26 +167,36 @@ class LagrangianSafetyLayer:
 
     def end_episode_update(self):
         """
-        Perform the dual update at the end of each episode.
-        Called inside env.reset() before clearing episode state.
+        Perform the PID dual update at the end of each episode (Improvement 3).
 
-        Dual update rule:
-            lambda_k <- clip(lambda_k + alpha * (mean_violation_k - threshold_k), 0, max_lambda)
+        PID update rule:
+            error_k = mean_violation_k - threshold_k
+            lambda_k <- clip(lambda_k
+                             + P * error_k
+                             + I * integral_k
+                             + D * (error_k - prev_error_k),   0, max_lambda)
 
-        If violations > threshold: lambda increases → heavier penalty next episode
-        If violations < threshold: lambda decreases → lighter penalty next episode
+        P (Proportional): Reacts to current violations, same as before.
+        I (Integral):     Accumulates persistent violations → heavier long-term penalty.
+        D (Derivative):   Reacts to sudden spikes, damping oscillations.
         """
         if len(self._episode_violations) == 0:
             return
 
-        # Mean violation across all steps in this episode
         mean_violations = np.mean(self._episode_violations, axis=0)
+        error = mean_violations - self.thresholds
 
-        # Gradient ascent on lambda
-        self.lambdas += self.alpha * (mean_violations - self.thresholds)
+        # PID components
+        proportional = self.alpha * error
+        self._integral = np.clip(self._integral + error, -self._integral_max, self._integral_max)
+        integral     = self.alpha_i * self._integral
+        derivative   = self.alpha_d * (error - self._prev_error)
 
-        # Enforce non-negativity and cap
+        self.lambdas += proportional + integral + derivative
         self.lambdas = np.clip(self.lambdas, 0.0, self.max_lambda)
+
+        # Update PID memory
+        self._prev_error = error.copy()
 
         # Log for TensorBoard
         self.lambda_history.append(self.lambdas.copy())

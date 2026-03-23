@@ -123,6 +123,40 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         self.liquidity_pool.last_prices = {"seller_price": 0.08, "buyer_price": 0.20}
         return out
 
+    def _get_grid_prices(self):
+        """
+        Improvement 5: Stochastic Grid Pricing.
+        Overrides the parent's fixed ToU schedule with:
+          - Gaussian noise on retail/feed-in (~±1 cent)
+          - 5% chance of a random price spike (1.5-2x normal retail)
+        This forces the model to learn robust arbitrage instead of
+        simply memorising a static Peak/Off-Peak timetable.
+        """
+        hour = self.current_idx % 24
+        # Base ToU prices (identical to parent defaults)
+        if 17 <= hour < 21:
+            base_retail, base_feed_in = 0.50, 0.10
+        else:
+            base_retail, base_feed_in = 0.20, 0.10
+
+        # Gaussian noise (std = 0.01 $/kWh)
+        noise_retail  = float(np.random.normal(0, 0.01))
+        noise_feed_in = float(np.random.normal(0, 0.005))
+
+        retail  = base_retail  + noise_retail
+        feed_in = base_feed_in + noise_feed_in
+
+        # 5 % probability of a random price spike
+        if np.random.random() < 0.05:
+            spike_factor = np.random.uniform(1.5, 2.0)
+            retail = retail * spike_factor
+
+        # Clamp to physical bounds
+        retail  = float(np.clip(retail,  0.10, 1.00))
+        feed_in = float(np.clip(feed_in, 0.05, retail - 0.05))
+
+        return retail, feed_in
+
 
     def _setup_agents(self):
         """

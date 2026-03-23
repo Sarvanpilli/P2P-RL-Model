@@ -36,7 +36,7 @@ import torch
 from collections import deque
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize, VecMonitor
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, VecMonitor
 from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     BaseCallback,
@@ -45,18 +45,23 @@ from stable_baselines3.common.callbacks import (
 # ─── Path fix ────────────────────────────────────────────────────────────────
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from research_q1.novelty.slim_env import EnergyMarketEnvSLIM
+from research_q1.novelty.gnn_policy import CTDEGNNPolicy
 
 
 # ─── Hyper-parameters ────────────────────────────────────────────────────────
 N_AGENTS        = 4
-TOTAL_TIMESTEPS = 300_000
+N_ENVS          = 12     # Improvement: Parallel environments for 16-core CPU
+TOTAL_TIMESTEPS = 500_000 # Increased for deeper learning with bigger capacity
 SEED            = 42
 MODEL_DIR       = "research_q1/models/slim_v2"
 LOG_DIR         = "research_q1/logs/slim_v2_tensorboard"
 
-# Curriculum stage boundaries
-STAGE_1_END = 50_000
-STAGE_2_END = 150_000
+# Improvement 3: Adaptive curriculum — stage transitions are now P2P-volume-based
+# (falls back to step-count if volume threshold never reached by the fallback step)
+STAGE_1_P2P_THRESHOLD = 15.0    # kWh: advance once avg rolling P2P ≥ 15 kWh
+STAGE_2_P2P_THRESHOLD = 30.0    # kWh: advance once avg rolling P2P ≥ 30 kWh
+STAGE_1_STEP_FALLBACK = 80_000  # max steps before forcing Stage 2 anyway
+STAGE_2_STEP_FALLBACK = 180_000 # max steps before forcing Stage 3 anyway
 
 # Stage reward weights  (p2p_bonus, no_buyer_penalty, grid_penalty)
 STAGE_1_WEIGHTS = dict(p2p_bonus=0.30, no_buyer_penalty=0.20, grid_penalty=0.05)
@@ -104,12 +109,18 @@ class CurriculumCallback(BaseCallback):
     def _on_step(self) -> bool:
         n = self.num_timesteps
 
-        # ── Stage transitions ──────────────────────────────────────────────
-        if n < STAGE_1_END:
-            self._apply_stage(1)
-        elif n < STAGE_2_END:
+        # ── Adaptive Stage Transitions (Improvement 4) ─────────────────────
+        # Advance based on achieved P2P volume (not just step count).
+        # Fall back to step-count gate if volume threshold is never reached.
+        rolling_p2p = float(np.mean(self._p2p_volume_buf)) if self._p2p_volume_buf else 0.0
+
+        if self._current_stage < 2 and (
+            rolling_p2p >= STAGE_1_P2P_THRESHOLD or n >= STAGE_1_STEP_FALLBACK
+        ):
             self._apply_stage(2)
-        else:
+        elif self._current_stage < 3 and (
+            rolling_p2p >= STAGE_2_P2P_THRESHOLD or n >= STAGE_2_STEP_FALLBACK
+        ):
             self._apply_stage(3)
 
         # ── Collect metrics from info dict ────────────────────────────────
@@ -152,7 +163,10 @@ class CurriculumCallback(BaseCallback):
 
 
 # ─── Environment factory ──────────────────────────────────────────────────────
-def make_env(seed: int = SEED):
+def make_env(rank: int, seed: int = SEED):
+    """
+    Utility for multiprocess env generation.
+    """
     def _init():
         env = EnergyMarketEnvSLIM(
             n_agents=N_AGENTS,
@@ -160,9 +174,9 @@ def make_env(seed: int = SEED):
             random_start_day=True,
             enable_ramp_rates=True,
             enable_losses=True,
-            seed=seed,
+            seed=seed + rank, # Unique seed per process
         )
-        # Immediately apply Stage-1 weights so the very first episodes use them
+        # Immediately apply Stage-1 weights
         env.set_reward_weights(**STAGE_1_WEIGHTS)
         return env
     return _init
@@ -174,16 +188,18 @@ def train():
     os.makedirs(LOG_DIR,   exist_ok=True)
 
     print("=" * 60)
-    print("  SLIM v2  —  Nash-Equilibrium Fix Retraining")
+    print("  SLIM v2.1 — High Performance Parallel Training")
     print("=" * 60)
+    print(f"  CPU Cores       : 16 (Detected)")
+    print(f"  Parallel Envs   : {N_ENVS} (Subproc)")
     print(f"  N_agents        : {N_AGENTS}")
     print(f"  Total timesteps : {TOTAL_TIMESTEPS:,}")
     print(f"  Model output    : {MODEL_DIR}")
     print(f"  TensorBoard     : {LOG_DIR}")
     print()
 
-    # Build vec-env
-    env = DummyVecEnv([make_env(SEED)])
+    # Build vectorized sub-processes (HIGH PERFORMANCE)
+    env = SubprocVecEnv([make_env(i, SEED) for i in range(N_ENVS)])
     env = VecMonitor(env)
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
@@ -210,23 +226,23 @@ def train():
     )
 
     model = PPO(
-        "MlpPolicy",
+        CTDEGNNPolicy,
         env,
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=256,          # increased from 64 for stability
+        n_steps=1024,            # per env → 1024 * 12 = 12,288 samples per update
+        batch_size=1024,         # Increased for better gradient estimation in parallel
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.02,           # increased from 0.01 — more exploration to escape all-seller trap
+        ent_coef=0.03,           # Increased slightly for even more exploration
         vf_coef=0.5,
         max_grad_norm=0.5,
         verbose=1,
-        policy_kwargs=policy_kwargs,
+        policy_kwargs={"n_agents": N_AGENTS}, # Pass n_agents to CTDEGNNPolicy
         tensorboard_log=LOG_DIR,
         seed=SEED,
-        device="auto",
+        device="cpu", # No CUDA detected
     )
 
     print(f"\n  Policy: {model.policy.__class__.__name__}")
