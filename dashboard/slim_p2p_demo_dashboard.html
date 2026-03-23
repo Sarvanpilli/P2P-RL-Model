@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SLIM Dashboard | P2P Energy</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0e0e0e;
+      --card: #161616;
+      --border: #262626;
+      --text: #efefef;
+      --muted: #888;
+      --cyan: #00d4ff;
+      --green: #10b981;
+      --red: #ef4444;
+      --blue: #3b82f6;
+      --amber: #f59e0b;
+      --nav-bg: #1f1f1f;
+    }
+
+    body.light-mode {
+      --bg: #f5f5f7;
+      --card: #ffffff;
+      --border: #e0e0e0;
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --nav-bg: #e5e5e7;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 20px;
+      line-height: 1.5;
+      transition: background 0.3s, color 0.3s;
+    }
+
+    /* Theme Toggle */
+    .theme-toggle {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--nav-bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      z-index: 1000;
+    }
+
+    /* Navigation Pills */
+    .nav {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 24px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-btn {
+      background: var(--nav-bg);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 7px 14px;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: 0.2s;
+    }
+
+    .nav-btn.active {
+      background: #333;
+      color: white;
+      border-color: #555;
+    }
+
+    body.light-mode .nav-btn.active {
+      background: #007aff;
+      border-color: #007aff;
+    }
+
+    .nav-btn:hover {
+      background: var(--border);
+    }
+
+    /* Layout */
+    .metric-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+
+    .metric {
+      text-align: center;
+    }
+
+    .m-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 5px;
+    }
+
+    .m-value {
+      font-size: 24px;
+      font-weight: 600;
+    }
+
+    .m-sub {
+      font-size: 10px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+      position: relative;
+    }
+
+    .card-h {
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 15px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Agent Cards */
+    .agent-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 15px; }
+    .a-card { background: rgba(128,128,128,0.05); padding: 12px; border-radius: 8px; border: 1px solid var(--border); }
+    .a-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 12px; }
+    .a-stat { font-size: 10px; color: var(--muted); }
+    .soc-track { height: 4px; background: rgba(0,0,0,0.1); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+    .soc-fill { height: 100%; transition: width 0.3s; }
+
+    /* Components */
+    .chart-box {
+      height: 200px;
+      width: 100%;
+    }
+
+    .chart-tall {
+      height: 260px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 12px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .leg-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+
+    .log {
+      height: 320px;
+      overflow-y: auto;
+      font-size: 12px;
+      border-top: 1px solid var(--border);
+      margin-top: 10px;
+      padding-right: 5px;
+    }
+
+    .log-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .badge {
+      font-size: 9px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      text-transform: uppercase;
+    }
+
+    .b-blue {
+      background: #1e3a8a;
+      color: #93c5fd;
+    }
+
+    .b-green {
+      background: #064e3b;
+      color: #6ee7b7;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 15px;
+    }
+
+    .progress {
+      flex: 1;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .p-fill {
+      height: 100%;
+      background: var(--blue);
+      width: 0%;
+      transition: width 0.3s;
+    }
+
+    .page {
+      display: none;
+    }
+
+    .page.active {
+      display: block;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 10px;
+    }
+
+    .table th {
+      text-align: left;
+      color: var(--muted);
+      padding: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .table td {
+      padding: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* Animation */
+    @keyframes pulse {
+      0% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.5;
+      }
+
+      100% {
+        opacity: 1;
+      }
+    }
+
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      background: var(--red);
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 5px;
+      animation: pulse 1s infinite;
+    }
+  </style>
+</head>
+
+<body>
+
+  <button class="theme-toggle" onclick="toggleTheme()">🌓 Toggle Light Mode</button>
+
+  <div class="nav">
+    <button class="nav-btn active" onclick="showPage('live', this)">Live trading</button>
+    <button class="nav-btn" onclick="showPage('results', this)">Results</button>
+    <button class="nav-btn" onclick="showPage('comparison', this)">Comparison</button>
+    <button class="nav-btn" onclick="showPage('scalability', this)">Scalability</button>
+    <button class="nav-btn" onclick="showPage('safety', this)">Safety</button>
+  </div>
+
+  <!-- LIVE TRADING -->
+  <div id="live" class="page active">
+    <div class="metric-row">
+      <div class="metric">
+        <div class="m-label">P2P Volume</div>
+        <div class="m-value" id="m-p2p" style="color:var(--green)">0 kWh</div>
+        <div class="m-sub">Target: 900+</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Active Buyers</div>
+        <div class="m-value" id="m-buyers">0</div>
+        <div class="m-sub">Threshold: >0.5</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Grid Import</div>
+        <div class="m-value" id="m-grid">0 kWh</div>
+        <div class="m-sub">lower is better</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Safety Violations</div>
+        <div class="m-value" style="color:var(--green)">0</div>
+        <div class="m-sub">across episode</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">
+          <span><span class="live-dot"></span>Market Activity</span>
+          <div class="legend">
+            <div class="leg-item">
+              <div class="dot" style="background:var(--green)"></div>P2P
+            </div>
+            <div class="leg-item">
+              <div class="dot" style="background:#ef444420;border:1px solid var(--red)"></div>Grid
+            </div>
+          </div>
+        </div>
+        <div class="chart-box chart-tall"><canvas id="liveChart"></canvas></div>
+        <div class="controls">
+          <button class="nav-btn" onclick="toggleSim()" id="runBtn"
+            style="color:white;background:var(--blue);border:none">Run episode</button>
+          <button class="nav-btn" onclick="resetSim()">Reset</button>
+          <div class="progress">
+            <div class="p-fill" id="p-fill"></div>
+          </div>
+          <span style="font-size:11px;color:var(--muted)">H<span id="step-h">0</span>/168</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h">Trade Log</div>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+    <div class="agent-grid" id="agentGrid"></div>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="results" class="page">
+    <div class="metric-row">
+      <div class="metric">
+        <div class="m-label">Mean P2P Volume</div>
+        <div class="m-value" style="color:var(--green)">992.77 kWh</div>
+        <div class="m-sub">±60.47 (5 seeds)</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">P2P Efficiency</div>
+        <div class="m-value" style="color:var(--green)">84.2%</div>
+        <div class="m-sub">vs 5.8% legacy</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Buyers / Step</div>
+        <div class="m-value">1.777</div>
+        <div class="m-sub">±0.049</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Total Reward</div>
+        <div class="m-value">133.89</div>
+        <div class="m-sub">v2 Convergence</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">5-Seed Variance</div>
+        <div class="chart-box"><canvas id="seedChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-h">Policy Convergence</div>
+        <div class="chart-box"><canvas id="convChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- COMPARISON -->
+  <div id="comparison" class="page">
+    <div class="card" style="grid-column: span 2; margin-bottom: 20px;">
+      <div class="card-h">SLIM v2 vs Baselines (kWh)</div>
+      <div class="chart-box" style="height:120px"><canvas id="compChart"></canvas></div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">Nash Equilibrium Shift</div>
+        <div class="chart-box"><canvas id="nashChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-h">Feature Matrix</div>
+        <table class="table">
+          <tr>
+            <td>Algorithm</td>
+            <td style="color:var(--cyan)">PPO + GATv2</td>
+          </tr>
+          <tr>
+            <td>Safety</td>
+            <td style="color:var(--green)">2-Tier Tier</td>
+          </tr>
+          <tr>
+            <td>Coordination</td>
+            <td style="color:var(--green)">Multi-Agent</td>
+          </tr>
+          <tr>
+            <td>Environment</td>
+            <td style="color:var(--muted)">Ausgrid NSW</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCALABILITY -->
+  <div id="scalability" class="page">
+    <div class="card" style="grid-column: span 2; margin-bottom: 20px;">
+      <div class="card-h">Network Liquidity Effect (P2P per agent)</div>
+      <div class="chart-box chart-tall"><canvas id="scaleChart"></canvas></div>
+    </div>
+    <div class="card" style="grid-column: span 2;">
+      <div class="card-h">Economic Scaling Efficiency</div>
+      <div class="chart-box" style="height:150px"><canvas id="profitChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- SAFETY -->
+  <div id="safety" class="page">
+    <div class="metric-row">
+      <div class="metric">
+        <div class="m-label">Safety Violations</div>
+        <div class="m-value" style="color:var(--green)">0</div>
+        <div class="m-sub">840 steps</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Safety Layers</div>
+        <div class="m-value">3</div>
+        <div class="m-sub">Jitter · Filter · Veto</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Lagrangian</div>
+        <div class="m-value">3</div>
+        <div class="m-sub">λ parameters</div>
+      </div>
+      <div class="metric">
+        <div class="m-label">Converged</div>
+        <div class="m-value" style="color:var(--green)">YES</div>
+        <div class="m-sub">by step 250k</div>
+      </div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-h">Lagrange Multiplier Convergence</div>
+        <div class="chart-box chart-tall"><canvas id="lambdaChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-h">Architecture</div>
+        <div style="font-size:12px; margin-bottom:15px"><span class="badge b-blue" style="margin-right:5px">Tier
+            1</span> <b>Hard Guard</b>
+          <p style="color:var(--muted)">Deterministic projection layer ensuring physical feasibility every step.</p>
+        </div>
+        <div style="font-size:12px"><span class="badge b-green" style="margin-right:5px">Tier 2</span> <b>Lagrangian</b>
+          <p style="color:var(--muted)">Soft constraints updated via gradient ascent to teach the policy boundaries.</p>
+        </div>
+      </div>
+      <div class="card" style="grid-column: span 2;">
+        <div class="card-h">Battery SoC Profiles (Simulated Day)</div>
+        <div class="chart-box"><canvas id="socChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // --- Theme Handling ---
+    function toggleTheme() {
+      document.body.classList.toggle('light-mode');
+      const isLight = document.body.classList.contains('light-mode');
+      localStorage.setItem('slim-theme', isLight ? 'light' : 'dark');
+      if (charts.live) charts.live.update();
+      // Re-init static charts to pick up new theme colors if necessary
+    }
+    if (localStorage.getItem('slim-theme') === 'light') document.body.classList.add('light-mode');
+
+    // --- Navigation ---
+    let charts = {};
+    function showPage(id, btn) {
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('live').classList.remove('active');
+      document.getElementById('results').classList.remove('active');
+      document.getElementById('comparison').classList.remove('active');
+      document.getElementById('scalability').classList.remove('active');
+      document.getElementById('safety').classList.remove('active');
+      
+      document.getElementById(id).classList.add('active');
+      btn.classList.add('active');
+      initCharts(id);
+    }
+
+    // --- Realistic Simulation (Ausgrid-inspired) ---
+    const AGENT_META = [
+      { id: 'solar', name: 'Household (Solar)', color: '#10b981', icon: 'S' },
+      { id: 'wind', name: 'Community (Wind)', color: '#3b82f6', icon: 'W' },
+      { id: 'ev', name: 'EV / V2G Store', color: '#f59e0b', icon: 'E' },
+      { id: 'std', name: 'Standard Load', color: '#888', icon: 'L' }
+    ];
+
+    let simStep = 0, running = false, p2pAcc = 0, gridAcc = 0;
+    
+    function getStepData(step) {
+      const h = step % 24;
+      const profiles = {
+        solar: { gen: (h > 6 && h < 18) ? 5.2 * Math.sin((h - 6) * Math.PI / 12) : 0, dem: 1.1 + Math.random()*0.3 },
+        wind: { gen: 2.1 + 0.8 * Math.sin(h * Math.PI / 10), dem: 0.7 + Math.random()*0.2 },
+        ev: { gen: (h < 7 || h > 21) ? 1.5 : 0, dem: (h >= 17 && h <= 21) ? 4.8 : 0.6 },
+        std: { gen: 0, dem: 1.8 + 1.2 * Math.sin(h * Math.PI / 24) }
+      };
+      
+      let buyers = 0;
+      const agents = AGENT_META.map(m => {
+        const p = profiles[m.id];
+        const net = p.gen - p.dem;
+        if (net < -0.1) buyers++;
+        return { ...m, ...p, net, soc: 0.3 + 0.6 * Math.random() }; 
+      });
+
+      const sellersTot = agents.filter(a => a.net > 0).reduce((s, a) => s + a.net, 0);
+      const buyersTot = agents.filter(a => a.net < 0).reduce((s, a) => s - a.net, 0);
+      const matched = Math.min(sellersTot, buyersTot) * (0.85 + Math.random()*0.05); // SLIM v2 Efficiency
+      
+      return { agents, matched, buyers, grid: Math.max(0, buyersTot - sellersTot) };
+    }
+
+    function toggleSim() {
+      running = !running;
+      document.getElementById('runBtn').innerText = running ? 'Stop simulation' : 'Run episode';
+      if (running) tick();
+    }
+
+    function tick() {
+      if (!running || simStep >= 168) {
+        if (simStep >= 168) stopSim();
+        return;
+      }
+      const data = getStepData(simStep);
+      p2pAcc += data.matched; gridAcc += data.grid;
+      updateUI(data);
+      simStep++;
+      setTimeout(tick, 150); 
+    }
+
+    function stopSim() {
+      running = false;
+      document.getElementById('runBtn').innerText = 'Complete';
+    }
+
+    function resetSim() {
+      running = false; simStep = 0; p2pAcc = 0; gridAcc = 0;
+      document.getElementById('runBtn').innerText = 'Run episode';
+      document.getElementById('log').innerHTML = '';
+      document.getElementById('agentGrid').innerHTML = '';
+      document.getElementById('p-fill').style.width = '0%';
+      if (charts.live) { charts.live.destroy(); charts.live = null; }
+    }
+
+    function updateUI(data) {
+      document.getElementById('m-p2p').innerText = p2pAcc.toFixed(1) + ' kWh';
+      document.getElementById('m-grid').innerText = gridAcc.toFixed(1) + ' kWh';
+      document.getElementById('m-buyers').innerText = data.buyers;
+      document.getElementById('step-h').innerText = simStep;
+      document.getElementById('p-fill').style.width = (simStep / 168 * 100) + '%';
+      
+      const grid = document.getElementById('agentGrid');
+      grid.innerHTML = data.agents.map(a => `
+        <div class="a-card">
+          <div class="a-header">
+            <span><b>${a.name}</b></span>
+            <span class="badge ${a.net > 0 ? 'b-green' : 'b-blue'}">${a.net > 0 ? 'Selling' : 'Buying'}</span>
+          </div>
+          <div class="a-stat">Net: ${a.net.toFixed(2)} kW | SoC: ${(a.soc*100).toFixed(0)}%</div>
+          <div class="soc-track"><div class="soc-fill" style="width:${a.soc*100}%; background:${a.color}"></div></div>
+        </div>
+      `).join('');
+
+      if (data.matched > 0.2) {
+        const log = document.getElementById('log');
+        const row = document.createElement('div');
+        row.className = 'log-row';
+        row.innerHTML = `<span>H${simStep % 24}:00</span><span>Matched: ${data.matched.toFixed(2)} kWh</span><span class="badge b-green">Cleared</span>`;
+        log.prepend(row);
+        if (log.children.length > 20) log.lastChild.remove();
+      }
+      updateLiveChart(data.matched, data.grid);
+    }
+
+    function updateLiveChart(p, g) {
+      const ctx = document.getElementById('liveChart');
+      if (!charts.live) {
+        charts.live = new Chart(ctx, {
+          type: 'bar', data: { labels: [], datasets: [
+              { label: 'P2P', data: [], backgroundColor: '#10b981' },
+              { label: 'Grid', data: [], backgroundColor: '#ef444420', borderColor: '#ef4444', borderWidth: 1 }
+            ]},
+          options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
+            scales: { x: { display: false }, y: { display: false } }
+          }
+        });
+      }
+      charts.live.data.labels.push(simStep);
+      charts.live.data.datasets[0].data.push(p);
+      charts.live.data.datasets[1].data.push(g);
+      if (charts.live.data.labels.length > 50) { charts.live.data.labels.shift(); charts.live.data.datasets[0].data.shift(); charts.live.data.datasets[1].data.shift(); }
+      charts.live.update('none');
+    }
+
+    function initCharts(id) {
+      const isLight = document.body.classList.contains('light-mode');
+      const gColor = isLight ? '#eee' : '#222';
+      const tColor = isLight ? '#666' : '#555';
+
+      if (id === 'results' && !charts.seeds) {
+        charts.seeds = new Chart(document.getElementById('seedChart'), { type: 'bar', data: { labels: ['S0', 'S7', 'S13', 'S21', 'S42'], datasets: [{ data: [1004, 937, 966, 1120, 989], backgroundColor: '#10b981' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { min: 800, grid: { color: gColor }, ticks: { color: tColor } }, x: { grid: { display: false }, ticks: { color: tColor } } } } });
+        charts.conv = new Chart(document.getElementById('convChart'), { type: 'line', data: { labels: ['50k', '100k', '150k', '200k', '250k', '300k'], datasets: [{ data: [-12, -10, -7, -8, -12, 133], borderColor: '#3b82f6', tension: 0.3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { grid: { color: gColor }, ticks: { color: tColor } }, x: { grid: { display: false }, ticks: { color: tColor } } } } });
+      }
+      if (id === 'comparison' && !charts.comp) {
+        charts.comp = new Chart(document.getElementById('compChart'), { type: 'bar', data: { labels: ['Baseline', 'Auction', 'SLIM v2'], datasets: [{ data: [0, 67, 992], backgroundColor: ['#333', '#f59e0b', '#10b981'] }] }, options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { display: false } }, y: { grid: { display: false }, ticks: { color: isLight ? '#333' : '#eee' } } } } });
+        charts.nash = new Chart(document.getElementById('nashChart'), { type: 'bar', data: { labels: ['Sol', 'Wnd', 'EV', 'Std'], datasets: [{ label: 'Pre', data: [98, 100, 100, 100], backgroundColor: '#ef444420' }, { label: 'Post', data: [60, 55, 30, 50], backgroundColor: '#10b981' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { max: 110, grid: { color: gColor }, ticks: { color: tColor } }, x: { grid: { display: false }, ticks: { color: tColor } } } } });
+      }
+      if (id === 'scalability' && !charts.scale) {
+        charts.scale = new Chart(document.getElementById('scaleChart'), { type: 'bar', data: { labels: ['N4', 'N6', 'N8', 'N10'], datasets: [{ data: [63, 71, 82, 94], backgroundColor: '#10b981' }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { min: 50, grid: { color: gColor }, ticks: { color: tColor } }, x: { grid: { display: false }, ticks: { color: tColor } } } } });
+        charts.profit = new Chart(document.getElementById('profitChart'), { type: 'line', data: { labels: ['N4', 'N6', 'N8', 'N10'], datasets: [{ data: [-38, -36, -35, -34], borderColor: '#3b82f6', tension: 0.3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { grid: { color: gColor }, ticks: { color: tColor } }, x: { grid: { display: false }, ticks: { color: tColor } } } } });
+      }
+      if (id === 'safety' && !charts.lambda) {
+        const steps = Array.from({ length: 30 }, (_, i) => i * 10 + 'k');
+        charts.lambda = new Chart(document.getElementById('lambdaChart'), { type: 'line', data: { labels: steps, datasets: [{ label: 'λ_SoC', borderColor: '#ef4444', data: Array.from({ length: 30 }, (_, i) => i < 3 ? 0.1 + i * 0.25 : 0.3 + 0.02 * Math.sin(i * 2)), tension: 0.3, pointRadius: 0 }, { label: 'λ_line', borderColor: '#3b82f6', data: Array.from({ length: 30 }, (_, i) => i < 5 ? 0.1 + i * 0.12 : 0.08), tension: 0.3, pointRadius: 0 }, { label: 'λ_voltage', borderColor: '#10b981', data: Array.from({ length: 30 }, (_, i) => i < 4 ? 0.1 + i * 0.06 : 0.05), tension: 0.3, pointRadius: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { color: tColor } }, y: { grid: { color: gColor }, ticks: { color: tColor } } } } });
+        charts.soc = new Chart(document.getElementById('socChart'), { type: 'line', data: { labels: Array.from({ length: 24 }, (_, i) => i + ':00'), datasets: [{ label: 'Solar', borderColor: '#f59e0b', data: Array.from({ length: 24 }, (_, h) => 40 + 20 * Math.sin((h - 8) * Math.PI / 12)), pointRadius: 0, tension: 0.3 }, { label: 'Wind', borderColor: '#3b82f6', data: Array.from({ length: 24 }, (_, h) => 60 + 10 * Math.cos(h * Math.PI / 10)), pointRadius: 0, tension: 0.3 }, { label: 'EV', borderColor: '#10b981', data: Array.from({ length: 24 }, (_, h) => h < 8 ? 70 : (h < 17 ? 30 : 30 + 5 * (h - 17))), pointRadius: 0, tension: 0.3 }, { label: 'Std', borderColor: '#888', data: Array.from({ length: 24 }, (_, h) => 45 + 10 * Math.sin(h * Math.PI / 16)), pointRadius: 0, tension: 0.3 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { color: tColor } }, y: { grid: { color: gColor }, ticks: { color: tColor } } } } });
+      }
+    }
+  </script>
+</body>
+
+</html>

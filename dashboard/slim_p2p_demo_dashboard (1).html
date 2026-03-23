@@ -1,0 +1,937 @@
+<!-- <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLIM — P2P Energy Trading Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+:root {
+  --green: #1D9E75; --green-light: #E1F5EE; --green-dark: #085041;
+  --blue: #378ADD; --blue-light: #E6F1FB; --blue-dark: #0C447C;
+  --amber: #EF9F27; --amber-light: #FAEEDA;
+  --red: #E24B4A; --red-light: #FCEBEB;
+  --gray: #888780; --gray-light: #F1EFE8;
+  --bg: #0d0d0f; --surface: #15151a; --surface2: #1e1e25;
+  --border: rgba(255,255,255,0.07); --border2: rgba(255,255,255,0.12);
+  --text: #e8e6e0; --text2: #9a9890; --text3: #5a5856;
+  --mono: 'IBM Plex Mono', monospace;
+  --sans: 'IBM Plex Sans', sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+.app{display:flex;height:100vh;overflow:hidden}
+
+/* SIDEBAR */
+.sidebar{width:220px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:20px 0}
+.logo{padding:0 20px 20px;border-bottom:1px solid var(--border);margin-bottom:8px}
+.logo-mark{font-family:var(--mono);font-size:22px;font-weight:500;color:var(--green);letter-spacing:-1px}
+.logo-sub{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;cursor:pointer;color:var(--text2);font-size:13px;transition:all 0.15s;border-left:2px solid transparent}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{color:var(--green);border-left-color:var(--green);background:rgba(29,158,117,0.08)}
+.nav-icon{width:16px;height:16px;opacity:0.7}
+.nav-item.active .nav-icon{opacity:1}
+.sidebar-footer{margin-top:auto;padding:16px 20px;border-top:1px solid var(--border)}
+.sidebar-footer div{font-size:11px;color:var(--text3);line-height:1.6}
+
+/* MAIN */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.topbar-title{font-size:13px;font-weight:500;color:var(--text2)}
+.topbar-right{display:flex;gap:8px;align-items:center}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.status-text{font-size:11px;color:var(--text3);font-family:var(--mono)}
+.content{flex:1;overflow-y:auto;padding:24px}
+.page{display:none}.page.active{display:block}
+
+/* METRIC CARDS */
+.metric-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+.metric-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px}
+.metric-label{font-size:11px;color:var(--text3);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px}
+.metric-value{font-size:26px;font-weight:500;font-family:var(--mono);color:var(--text)}
+.metric-value.green{color:var(--green)}
+.metric-sub{font-size:11px;color:var(--text3);margin-top:4px}
+
+/* GRID */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
+.span2{grid-column:span 2}
+
+/* CARD */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:18px}
+.card-title{font-size:12px;font-weight:500;color:var(--text2);font-family:var(--mono);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px}
+
+/* BADGE */
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-family:var(--mono);padding:3px 8px;border-radius:4px;font-weight:500}
+.badge-green{background:rgba(29,158,117,0.15);color:var(--green);border:1px solid rgba(29,158,117,0.3)}
+.badge-blue{background:rgba(55,138,221,0.15);color:var(--blue);border:1px solid rgba(55,138,221,0.3)}
+.badge-amber{background:rgba(239,159,39,0.15);color:var(--amber);border:1px solid rgba(239,159,39,0.3)}
+.badge-red{background:rgba(226,75,74,0.15);color:var(--red);border:1px solid rgba(226,75,74,0.3)}
+.badge-gray{background:rgba(136,135,128,0.15);color:var(--gray);border:1px solid rgba(136,135,128,0.3)}
+
+/* AGENT CARDS */
+.agent-card{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:8px}
+.agent-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.agent-id{display:flex;align-items:center;gap:8px}
+.agent-avatar{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;font-weight:500}
+.agent-name{font-size:13px;font-weight:500}
+.agent-detail{font-size:11px;color:var(--text3);font-family:var(--mono);margin-bottom:6px}
+.soc-bar{height:4px;background:rgba(255,255,255,0.08);border-radius:2px;overflow:hidden}
+.soc-fill{height:100%;border-radius:2px;transition:width 0.6s ease}
+
+/* TRADE LOG */
+.trade-log{max-height:200px;overflow-y:auto}
+.trade-row{display:grid;grid-template-columns:48px 1fr 80px 60px;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px}
+.trade-row:last-child{border-bottom:none}
+.trade-hour{font-family:var(--mono);color:var(--text3);font-size:11px}
+
+/* PROGRESS */
+.progress-wrap{margin-bottom:16px}
+.progress-label{display:flex;justify-content:space-between;font-size:11px;color:var(--text3);font-family:var(--mono);margin-bottom:6px}
+.progress-track{height:3px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;background:var(--green);border-radius:2px;transition:width 0.3s}
+
+/* CONTROLS */
+.controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.btn{font-size:12px;font-family:var(--mono);padding:7px 16px;border:1px solid var(--border2);border-radius:5px;background:transparent;color:var(--text2);cursor:pointer;transition:all 0.15s}
+.btn:hover{background:var(--surface2);color:var(--text)}
+.btn.primary{background:rgba(29,158,117,0.15);color:var(--green);border-color:rgba(29,158,117,0.4)}
+.btn.primary:hover{background:rgba(29,158,117,0.25)}
+.btn.active{background:var(--surface2);color:var(--text);border-color:var(--border2)}
+
+/* TABLE */
+.slim-table{width:100%;border-collapse:collapse;font-size:12px}
+.slim-table th{background:var(--surface2);color:var(--text3);font-family:var(--mono);font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.5px;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border2)}
+.slim-table td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text)}
+.slim-table tr:last-child td{border-bottom:none}
+.slim-table tr.highlight td{color:var(--green);font-weight:500}
+.slim-table td.good{color:var(--green);font-family:var(--mono)}
+.slim-table td.mono{font-family:var(--mono)}
+
+/* CHART WRAP */
+.chart-wrap{position:relative;width:100%}
+.h160{height:160px}.h200{height:200px}.h220{height:220px}
+
+/* MARKET PRICE BAR */
+.mkt-bar{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.mkt-label{font-size:11px;color:var(--text3);font-family:var(--mono)}
+.mkt-price{font-size:16px;font-weight:500;font-family:var(--mono);color:var(--text)}
+
+/* OVERVIEW CARDS */
+.overview-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:20px}
+.overview-card h3{font-size:13px;font-weight:500;margin-bottom:8px;color:var(--text)}
+.overview-card p{font-size:13px;color:var(--text2);line-height:1.7}
+
+/* TIMELINE */
+.timeline{display:flex;gap:0;margin:16px 0;overflow-x:auto;padding-bottom:8px}
+.tl-step{flex:1;min-width:90px;text-align:center;position:relative}
+.tl-step::before{content:'';position:absolute;top:12px;left:50%;right:-50%;height:2px;background:var(--border2)}
+.tl-step:last-child::before{display:none}
+.tl-dot{width:24px;height:24px;border-radius:50%;background:var(--surface2);border:2px solid var(--border2);display:flex;align-items:center;justify-content:center;margin:0 auto 8px;font-size:10px;font-family:var(--mono);color:var(--text3);position:relative;z-index:1}
+.tl-dot.done{border-color:var(--green);color:var(--green);background:rgba(29,158,117,0.1)}
+.tl-dot.collapse{border-color:var(--red);color:var(--red);background:rgba(226,75,74,0.1)}
+.tl-label{font-size:10px;color:var(--text3);line-height:1.3;padding:0 4px}
+
+/* COMPARISON BAR */
+.cmp-bar-wrap{margin-bottom:10px}
+.cmp-bar-label{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px}
+.cmp-bar-name{color:var(--text2)}
+.cmp-bar-val{font-family:var(--mono);font-weight:500}
+.cmp-track{height:10px;background:var(--surface2);border-radius:5px;overflow:hidden}
+.cmp-fill{height:100%;border-radius:5px;transition:width 1s ease}
+
+/* ARCH CARDS */
+.arch-card{background:var(--surface2);border-radius:8px;padding:16px;border-left:3px solid}
+.arch-title{font-size:13px;font-weight:500;margin-bottom:6px}
+.arch-body{font-size:12px;color:var(--text2);line-height:1.7}
+.arch-formula{font-family:var(--mono);font-size:11px;background:rgba(255,255,255,0.04);padding:8px 10px;border-radius:4px;margin-top:8px;color:var(--blue)}
+
+/* SCROLLBAR */
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+  <div class="logo">
+    <div class="logo-mark">SLIM</div>
+    <div class="logo-sub">P2P Energy Trading</div>
+  </div>
+  <div class="nav-item active" onclick="nav('overview',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="1" y="1" width="6" height="6" rx="1" />
+      <rect x="9" y="1" width="6" height="6" rx="1" />
+      <rect x="1" y="9" width="6" height="6" rx="1" />
+      <rect x="9" y="9" width="6" height="6" rx="1" />
+    </svg>
+    Overview
+  </div>
+  <div class="nav-item" onclick="nav('live',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <polygon points="5,2 14,8 5,14" />
+    </svg>
+    Live trading
+  </div>
+  <div class="nav-item" onclick="nav('results',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="1" y="9" width="3" height="6" />
+      <rect x="6" y="5" width="3" height="10" />
+      <rect x="11" y="2" width="3" height="13" />
+    </svg>
+    Results
+  </div>
+  <div class="nav-item" onclick="nav('comparison',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <circle cx="5" cy="8" r="3" />
+      <circle cx="11" cy="8" r="3" />
+      <line x1="8" y1="5" x2="8" y2="11" />
+    </svg>
+    Comparison
+  </div>
+  <div class="nav-item" onclick="nav('scalability',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <polyline points="1,12 5,6 9,9 15,3" />
+    </svg>
+    Scalability
+  </div>
+  <div class="nav-item" onclick="nav('safety',this)">
+    <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M8 1L2 4v4c0 3.3 2.5 6.3 6 7 3.5-.7 6-3.7 6-7V4z" />
+    </svg>
+    Safety
+  </div>
+  <div class="sidebar-footer">
+    <div>SLIM v2 · GATv2 + PPO</div>
+    <div>Ausgrid NSW · 2017</div>
+    <div style="margin-top:4px;color:var(--green)">5-seed evaluated</div>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+  <div class="topbar">
+    <div class="topbar-title">SLIM — Safety-constrained Liquidity-Integrated Market</div>
+    <div class="topbar-right">
+      <div class="status-dot"></div>
+      <div class="status-text">SLIM v2 · 300k steps · violations: 0</div>
+    </div>
+  </div>
+
+  <div class="content">
+
+    <!-- PAGE: OVERVIEW -->
+    <div id="page-overview" class="page active">
+      <div class="metric-row">
+        <div class="metric-card">
+          <div class="metric-label">P2P volume</div>
+          <div class="metric-value green">992.77</div>
+          <div class="metric-sub">kWh · ±60.47 · 5 seeds</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Buyers / step</div>
+          <div class="metric-value green">1.777</div>
+          <div class="metric-sub">±0.049 · target >0.5</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Improvement</div>
+          <div class="metric-value green">+1363%</div>
+          <div class="metric-sub">vs legacy auction (67.83 kWh)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Safety violations</div>
+          <div class="metric-value green">0</div>
+          <div class="metric-sub">across 840 timesteps</div>
+        </div>
+      </div>
+
+      <div class="grid-3" style="margin-bottom:20px">
+        <div class="overview-card">
+          <h3>The problem</h3>
+          <p>Households with solar sell back to the grid at $0.10/kWh while neighbours buy at $0.50/kWh. The utility
+            captures a 40-cent spread for energy that could travel 10 metres over a fence.</p>
+        </div>
+        <div class="overview-card">
+          <h3>The solution</h3>
+          <p>SLIM trains 4 autonomous agents — Solar, Wind, EV/V2G, Standard — to trade energy peer-to-peer using a
+            Uniform Price Double Auction and a GATv2 Graph Neural Network policy.</p>
+        </div>
+        <div class="overview-card">
+          <h3>The breakthrough</h3>
+          <p>The initial model collapsed to an all-seller Nash equilibrium (zero buyers, zero P2P). Three targeted fixes
+            broke this trap, achieving 992.77 kWh — 1363% above the auction baseline.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Development roadmap — 8 phases</div>
+        <div class="timeline">
+          <div class="tl-step">
+            <div class="tl-dot done">1</div>
+            <div class="tl-label">Env setup</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">2</div>
+            <div class="tl-label">Real data</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">3</div>
+            <div class="tl-label">Grid safety</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">4</div>
+            <div class="tl-label">LSTM + forecast</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot collapse">5</div>
+            <div class="tl-label">Nash collapse</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">6</div>
+            <div class="tl-label">Nash fix</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">7</div>
+            <div class="tl-label">SLIM v2 eval</div>
+          </div>
+          <div class="tl-step">
+            <div class="tl-dot done">8</div>
+            <div class="tl-label">GNN analysis</div>
+          </div>
+        </div>
+        <div style="display:flex;gap:16px;margin-top:8px">
+          <span style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:5px"><span
+              style="width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block"></span>Complete</span>
+          <span style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:5px"><span
+              style="width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block"></span>Nash
+            collapse discovered &amp; resolved</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAGE: LIVE TRADING -->
+    <div id="page-live" class="page">
+      <div class="metric-row">
+        <div class="metric-card">
+          <div class="metric-label">P2P this episode</div>
+          <div class="metric-value green" id="m-p2p">0.00 kWh</div>
+          <div class="metric-sub">target >900 kWh</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Active buyers</div>
+          <div class="metric-value" id="m-buyers">0</div>
+          <div class="metric-sub">threshold >0.5</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Grid import</div>
+          <div class="metric-value" id="m-grid">0.00 kWh</div>
+          <div class="metric-sub">lower is better</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Safety violations</div>
+          <div class="metric-value green">0</div>
+          <div class="metric-sub">guaranteed by AutonomousGuard</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="btn" onclick="setSpd(1000,this)">slow</button>
+        <button class="btn active" id="spd-norm" onclick="setSpd(400,this)">normal</button>
+        <button class="btn" onclick="setSpd(80,this)">fast</button>
+        <button class="btn primary" id="run-btn" onclick="toggleSim()">Run episode</button>
+        <button class="btn" onclick="resetSim()">Reset</button>
+        <div style="flex:1;min-width:140px">
+          <div class="progress-label"><span>Step <span id="step-n">0</span> / 168</span><span id="hour-disp">hour
+              00:00</span></div>
+          <div class="progress-track">
+            <div class="progress-fill" id="ep-prog" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">Agent states</div>
+          <div id="agent-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Trade log</div>
+          <div class="mkt-bar">
+            <div>
+              <div class="mkt-label">Clearing price</div>
+              <div class="mkt-price" id="clr-price">—</div>
+            </div>
+            <span id="mkt-status" class="badge badge-gray">waiting</span>
+          </div>
+          <div class="trade-log" id="trade-log">
+            <div style="font-size:12px;color:var(--text3);text-align:center;padding:24px">Press Run to begin simulation
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Energy flows — last 24 hours</div>
+        <div style="display:flex;gap:16px;margin-bottom:10px">
+          <span style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:5px"><span
+              style="width:10px;height:10px;border-radius:2px;background:#1D9E75;display:inline-block"></span>P2P traded
+            (kWh)</span>
+          <span style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:5px"><span
+              style="width:10px;height:10px;border-radius:2px;background:#E24B4A;display:inline-block"></span>Grid
+            import (kWh)</span>
+          <span style="font-size:11px;color:var(--text3);display:flex;align-items:center;gap:5px"><span
+              style="width:10px;height:10px;border-radius:2px;background:#378ADD;display:inline-block"></span>Clearing
+            price ($/kWh)</span>
+        </div>
+        <div class="chart-wrap h200"><canvas id="flow-chart"></canvas></div>
+      </div>
+    </div>
+
+    <!-- PAGE: RESULTS -->
+    <div id="page-results" class="page">
+      <div class="metric-row">
+        <div class="metric-card">
+          <div class="metric-label">SLIM v2 P2P</div>
+          <div class="metric-value green">992.77</div>
+          <div class="metric-sub">±60.47 kWh · 5 seeds</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">vs auction</div>
+          <div class="metric-value green">+1363%</div>
+          <div class="metric-sub">992.77 vs 67.83 kWh</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Buyers/step</div>
+          <div class="metric-value green">1.777</div>
+          <div class="metric-sub">±0.049 · target >0.5</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Mean reward</div>
+          <div class="metric-value">133.89</div>
+          <div class="metric-sub">±5.92 · 5 seeds</div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">5-seed P2P volume (kWh)</div>
+          <div class="chart-wrap h220"><canvas id="seed-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Policy convergence — reward vs training steps</div>
+          <div class="chart-wrap h220"><canvas id="conv-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Before Nash fix — all agents selling</div>
+          <div class="chart-wrap h200"><canvas id="nash-before"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">After Nash fix — diverse buyer/seller roles</div>
+          <div class="chart-wrap h200"><canvas id="nash-after"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAGE: COMPARISON -->
+    <div id="page-comparison" class="page">
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">P2P volume comparison</div>
+        <div style="margin-bottom:20px">
+          <div class="cmp-bar-wrap">
+            <div class="cmp-bar-label"><span class="cmp-bar-name">Baseline (no P2P)</span><span class="cmp-bar-val"
+                style="color:var(--text3)">0.00 kWh</span></div>
+            <div class="cmp-track">
+              <div class="cmp-fill" style="width:0%;background:#888780"></div>
+            </div>
+          </div>
+          <div class="cmp-bar-wrap" style="margin-top:10px">
+            <div class="cmp-bar-label"><span class="cmp-bar-name">Legacy auction</span><span class="cmp-bar-val"
+                style="color:var(--amber)">67.83 kWh</span></div>
+            <div class="cmp-track">
+              <div class="cmp-fill" style="width:6.8%;background:#EF9F27"></div>
+            </div>
+          </div>
+          <div class="cmp-bar-wrap" style="margin-top:10px">
+            <div class="cmp-bar-label"><span class="cmp-bar-name" style="color:var(--green);font-weight:500">SLIM v2
+                (ours)</span><span class="cmp-bar-val" style="color:var(--green)">992.77 kWh · +1363%</span></div>
+            <div class="cmp-track">
+              <div class="cmp-fill" style="width:100%;background:#1D9E75"></div>
+            </div>
+          </div>
+        </div>
+        <table class="slim-table">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Baseline</th>
+              <th>Legacy auction</th>
+              <th>SLIM v2</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>P2P volume (kWh)</td>
+              <td class="mono">0.00 ±0.00</td>
+              <td class="mono">67.83 ±27.29</td>
+              <td class="good">992.77 ±60.47</td>
+            </tr>
+            <tr>
+              <td>Buyers per step</td>
+              <td class="mono">0.00</td>
+              <td class="mono">—</td>
+              <td class="good">1.777 ±0.049</td>
+            </tr>
+            <tr>
+              <td>Safety violations</td>
+              <td class="mono">—</td>
+              <td class="mono">—</td>
+              <td class="good">0</td>
+            </tr>
+            <tr>
+              <td>Mean reward</td>
+              <td class="mono">—</td>
+              <td class="mono">—</td>
+              <td class="mono">133.89 ±5.92</td>
+            </tr>
+            <tr>
+              <td>GNN policy</td>
+              <td>—</td>
+              <td>—</td>
+              <td><span class="badge badge-green">GATv2</span></td>
+            </tr>
+            <tr>
+              <td>Safety layer</td>
+              <td>—</td>
+              <td>—</td>
+              <td><span class="badge badge-blue">2-tier</span></td>
+            </tr>
+            <tr class="highlight">
+              <td>Nash fix</td>
+              <td>—</td>
+              <td>—</td>
+              <td><span class="badge badge-green">3-fix curriculum</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-title">Literature positioning</div>
+        <table class="slim-table">
+          <thead>
+            <tr>
+              <th>Paper</th>
+              <th>Method</th>
+              <th>P2P active</th>
+              <th>Safety</th>
+              <th>Gap vs SLIM v2</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>[1] Consensus-MARL</td>
+              <td>Federated MARL</td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td><span class="badge badge-amber">partial</span></td>
+              <td>Stylised network only</td>
+            </tr>
+            <tr>
+              <td>[2] MADDPG+PPO</td>
+              <td>A4SG ecosystem</td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td><span class="badge badge-red">no</span></td>
+              <td>No physical constraints</td>
+            </tr>
+            <tr>
+              <td>[6] MASAL</td>
+              <td>Trust region CTDE</td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td>Needs accurate network model</td>
+            </tr>
+            <tr>
+              <td>[8] Static auction</td>
+              <td>Double auction</td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td><span class="badge badge-red">no</span></td>
+              <td>Cannot adapt to real-time</td>
+            </tr>
+            <tr class="highlight">
+              <td>SLIM v2 (ours)</td>
+              <td>GATv2+PPO+Lagrangian</td>
+              <td><span class="badge badge-green">yes</span></td>
+              <td><span class="badge badge-green">2-tier</span></td>
+              <td>—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- PAGE: SCALABILITY -->
+    <div id="page-scalability" class="page">
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title">Network effect — P2P volume per agent as community scales</div>
+        <div class="chart-wrap h220"><canvas id="scale-chart"></canvas></div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Scalability data</div>
+          <table class="slim-table">
+            <thead>
+              <tr>
+                <th>N agents</th>
+                <th>P2P / agent (kWh)</th>
+                <th>Profit / agent ($)</th>
+                <th>Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>4</td>
+                <td class="mono">63.66</td>
+                <td class="mono">-38.05</td>
+                <td>—</td>
+              </tr>
+              <tr>
+                <td>6</td>
+                <td class="mono">71.12</td>
+                <td class="mono">-36.42</td>
+                <td class="good">+11.7%</td>
+              </tr>
+              <tr>
+                <td>8</td>
+                <td class="mono">82.45</td>
+                <td class="mono">-35.11</td>
+                <td class="good">+29.5%</td>
+              </tr>
+              <tr class="highlight">
+                <td>10</td>
+                <td class="mono">94.20</td>
+                <td class="mono">-33.88</td>
+                <td>+48.0%</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-title">Why more agents trade more</div>
+          <p style="font-size:13px;color:var(--text2);line-height:1.7;margin-bottom:12px">Larger networks have higher
+            prosumer diversity — solar peaks at midday, wind at night, EV returns at 17:00. More diverse profiles mean
+            higher probability of finding a complementary buyer for every seller.</p>
+          <p style="font-size:13px;color:var(--text2);line-height:1.7">This is the <strong
+              style="color:var(--green)">network liquidity effect</strong> — the core finding of the scalability
+            experiments. Profit improves monotonically from -$38.05 to -$33.88 as N grows to 10.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAGE: SAFETY -->
+    <div id="page-safety" class="page">
+      <div class="metric-row">
+        <div class="metric-card">
+          <div class="metric-label">Hard violations</div>
+          <div class="metric-value green">0</div>
+          <div class="metric-sub">840 eval timesteps</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Safety layers</div>
+          <div class="metric-value">3</div>
+          <div class="metric-sub">jitter · feasibility · veto</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Lagrangian λ</div>
+          <div class="metric-value">3</div>
+          <div class="metric-sub">SoC · line · voltage</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">λ converged</div>
+          <div class="metric-value green">yes</div>
+          <div class="metric-sub">by step 250k</div>
+        </div>
+      </div>
+      <div class="grid-2" style="margin-bottom:16px">
+        <div class="arch-card" style="border-color:var(--blue)">
+          <div class="arch-title" style="color:var(--blue)">Tier 1 — projection-based (AutonomousGuard)</div>
+          <div class="arch-body">Deterministic, stateless. Three layers: jitter clipping (slew rate limiting),
+            FeasibilityFilter (SoC bounds, surplus limits), SafetySupervisor (hard veto with zero-action fallback).
+            Guarantees zero violations every timestep regardless of policy quality.</div>
+          <div style="margin-top:10px"><span class="badge badge-blue">hard guarantee</span></div>
+        </div>
+        <div class="arch-card" style="border-color:var(--green)">
+          <div class="arch-title" style="color:var(--green)">Tier 2 — Lagrangian primal-dual (LagrangianSafetyLayer)
+          </div>
+          <div class="arch-body">Soft constraints via reward shaping. Three Lagrange multipliers updated after each
+            episode via gradient ascent. Teaches the policy where the safety boundary is — reducing hard-clip
+            interventions over training.</div>
+          <div class="arch-formula">λ_k ← clip(λ_k + α(violation_k − threshold_k), 0, λ_max)</div>
+          <div style="margin-top:10px"><span class="badge badge-green">learned safety</span></div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Lagrange multiplier convergence</div>
+          <div class="chart-wrap h220"><canvas id="lambda-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Battery SoC profiles — 24-hour episode</div>
+          <div class="chart-wrap h220"><canvas id="soc-chart"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- end content -->
+</div><!-- end main -->
+</div><!-- end app -->
+
+<script>
+  function nav(page, el) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.getElementById('page-' + page).classList.add('active');
+    el.classList.add('active');
+    if (page === 'results') initResults();
+    if (page === 'comparison') initComparison();
+    if (page === 'scalability') initScale();
+    if (page === 'safety') initSafety();
+  }
+
+  // ── SIMULATION ──────────────────────────────────────────────────
+  const AGENTS = [
+    { name: 'Solar', color: '#EF9F27', bg: 'rgba(239,159,39,0.15)', icon: 'S' },
+    { name: 'Wind', color: '#378ADD', bg: 'rgba(55,138,221,0.15)', icon: 'W' },
+    { name: 'EV/V2G', color: '#1D9E75', bg: 'rgba(29,158,117,0.15)', icon: 'E' },
+    { name: 'Std', color: '#888780', bg: 'rgba(136,135,128,0.15)', icon: 'H' },
+  ];
+  let simTimer = null, simStep = 0, simRunning = false, simSpeed = 400;
+  let epP2P = 0, epGrid = 0;
+  let flowP2P = [], flowGrid = [], flowPrice = [];
+  let flowChart = null;
+
+  function step(s) {
+    const h = s % 24;
+    const solar = h >= 6 && h <= 18 ? Math.max(0, Math.sin((h - 6) * Math.PI / 12)) * 0.8 : 0;
+    const wind = 0.3 + 0.2 * Math.sin(h * Math.PI / 12 + 1);
+    const gen = [solar, wind * 0.5, solar * 0.3, solar * 0.4];
+    const dem = [
+      0.4 + 0.3 * Math.sin((h - 8) * Math.PI / 12 + 0.5),
+      0.3 + 0.2 * Math.cos(h * 0.4),
+      0.2 + (h >= 17 && h <= 21 ? 0.6 : 0.1),
+      0.5 + 0.2 * Math.sin(h * 0.3)
+    ];
+    const sur = gen.map((g, i) => g - dem[i]);
+    const soc = [
+      Math.max(0.1, 0.2 + 0.6 * (1 - solar)),
+      Math.max(0.1, 0.4 + 0.2 * wind),
+      h >= 17 ? Math.min(0.95, 0.3 + (h - 17) * 0.08) : h < 8 ? 0.7 : 0.3,
+      Math.max(0.1, 0.45 + 0.15 * Math.sin(h * Math.PI / 16))
+    ];
+    const sellers = sur.filter(x => x > 0.05).length;
+    const buyers = sur.filter(x => x < -0.05).length;
+    const p2p = sellers > 0 && buyers > 0 ? Math.min(sellers, buyers) * (0.15 + Math.random() * 0.1) : 0;
+    const price = p2p > 0 ? 0.20 + Math.random() * 0.15 : 0.10;
+    return { h, gen, dem, sur, soc, sellers, buyers, p2p, price };
+  }
+
+  function runStep() {
+    if (simStep >= 168) { stopSim(); return; }
+    const d = step(simStep);
+    epP2P += d.p2p; epGrid += Math.max(0, -d.sur.reduce((a, b) => a + b, 0)) * 0.3;
+    document.getElementById('m-p2p').textContent = epP2P.toFixed(2) + ' kWh';
+    document.getElementById('m-grid').textContent = epGrid.toFixed(2) + ' kWh';
+    document.getElementById('m-buyers').textContent = d.buyers;
+    document.getElementById('step-n').textContent = simStep + 1;
+    document.getElementById('hour-disp').textContent = 'hour ' + String(d.h).padStart(2, '0') + ':00';
+    document.getElementById('ep-prog').style.width = ((simStep + 1) / 168 * 100) + '%';
+    document.getElementById('clr-price').textContent = d.p2p > 0 ? '$' + d.price.toFixed(2) + '/kWh' : 'no trade';
+    const ms = document.getElementById('mkt-status');
+    if (d.p2p > 0) { ms.textContent = 'cleared'; ms.className = 'badge badge-green'; }
+    else { ms.textContent = 'no match'; ms.className = 'badge badge-amber'; }
+    updateAgents(d);
+    if (d.p2p > 0) addTrade(d);
+    flowP2P.push(parseFloat(d.p2p.toFixed(3)));
+    flowGrid.push(parseFloat((Math.max(0, -d.sur.reduce((a, b) => a + b, 0)) * 0.3).toFixed(3)));
+    flowPrice.push(parseFloat(d.price.toFixed(3)));
+    if (flowP2P.length > 24) { flowP2P.shift(); flowGrid.shift(); flowPrice.shift(); }
+    updateFlowChart();
+    simStep++;
+  }
+
+  function updateAgents(d) {
+    document.getElementById('agent-list').innerHTML = AGENTS.map((a, i) => {
+      const r = d.sur[i] > 0.05 ? ['selling', 'badge-green'] : d.sur[i] < -0.05 ? ['buying', 'badge-blue'] : ['idle', 'badge-amber'];
+      const socPct = Math.round(d.soc[i] * 100);
+      const fillColor = d.soc[i] > 0.6 ? '#1D9E75' : d.soc[i] > 0.3 ? '#EF9F27' : '#E24B4A';
+      return `<div class="agent-card">
+      <div class="agent-header">
+        <div class="agent-id"><div class="agent-avatar" style="background:${a.bg};color:${a.color}">${a.icon}</div><div class="agent-name">${a.name}</div></div>
+        <span class="badge ${r[1]}">${r[0]}</span>
+      </div>
+      <div class="agent-detail">gen ${d.gen[i].toFixed(2)} kW · demand ${d.dem[i].toFixed(2)} kW · SoC ${socPct}%</div>
+      <div class="soc-bar"><div class="soc-fill" style="width:${socPct}%;background:${fillColor}"></div></div>
+    </div>`;
+    }).join('');
+  }
+
+  function addTrade(d) {
+    const log = document.getElementById('trade-log');
+    if (log.children.length === 1 && log.children[0].tagName !== 'DIV'.toLowerCase()) log.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'trade-row';
+    row.innerHTML = `<span class="trade-hour">h${String(d.h).padStart(2, '0')}:00</span><span style="color:var(--text2)">${d.sellers} → ${d.buyers}</span><span style="font-family:var(--mono);font-weight:500">${d.p2p.toFixed(2)} kWh</span><span class="badge badge-green">$${d.price.toFixed(2)}</span>`;
+    log.prepend(row);
+    while (log.children.length > 14) log.lastChild.remove();
+  }
+
+  function updateFlowChart() {
+    const labels = flowP2P.map((_, i) => 'h' + (simStep - flowP2P.length + i));
+    if (!flowChart) {
+      const ctx = document.getElementById('flow-chart').getContext('2d');
+      flowChart = new Chart(ctx, {
+        data: {
+          labels,
+          datasets: [
+            { type: 'bar', label: 'P2P', data: [...flowP2P], backgroundColor: '#1D9E7560', borderColor: '#1D9E75', borderWidth: 1 },
+            { type: 'bar', label: 'Grid', data: [...flowGrid], backgroundColor: '#E24B4A40', borderColor: '#E24B4A', borderWidth: 1 },
+            { type: 'line', label: 'Price', data: [...flowPrice], borderColor: '#378ADD', borderWidth: 1.5, pointRadius: 0, yAxisID: 'y2', fill: false, tension: 0.3 }
+          ]
+        },
+        options: { responsive: true, maintainAspectRatio: false, animation: { duration: 0 }, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#5a5856', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }, y: { ticks: { color: '#5a5856', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }, y2: { position: 'right', ticks: { color: '#378ADD', font: { size: 10 } }, grid: { display: false } } } }
+      });
+    } else {
+      flowChart.data.labels = labels;
+      flowChart.data.datasets[0].data = [...flowP2P];
+      flowChart.data.datasets[1].data = [...flowGrid];
+      flowChart.data.datasets[2].data = [...flowPrice];
+      flowChart.update('none');
+    }
+  }
+
+  function toggleSim() {
+    if (simRunning) { stopSim(); return; }
+    simRunning = true;
+    document.getElementById('run-btn').textContent = 'Pause';
+    simTimer = setInterval(runStep, simSpeed);
+  }
+  function stopSim() {
+    clearInterval(simTimer); simRunning = false;
+    document.getElementById('run-btn').textContent = simStep >= 168 ? 'Complete' : 'Resume';
+  }
+  function resetSim() {
+    stopSim(); simStep = 0; epP2P = 0; epGrid = 0;
+    flowP2P = []; flowGrid = []; flowPrice = [];
+    if (flowChart) { flowChart.destroy(); flowChart = null; }
+    document.getElementById('m-p2p').textContent = '0.00 kWh';
+    document.getElementById('m-grid').textContent = '0.00 kWh';
+    document.getElementById('m-buyers').textContent = '0';
+    document.getElementById('step-n').textContent = '0';
+    document.getElementById('hour-disp').textContent = 'hour 00:00';
+    document.getElementById('ep-prog').style.width = '0%';
+    document.getElementById('run-btn').textContent = 'Run episode';
+    document.getElementById('clr-price').textContent = '—';
+    document.getElementById('mkt-status').textContent = 'waiting';
+    document.getElementById('mkt-status').className = 'badge badge-gray';
+    document.getElementById('trade-log').innerHTML = '<div style="font-size:12px;color:var(--text3);text-align:center;padding:24px">Press Run to begin simulation</div>';
+    updateAgents(step(0));
+  }
+  function setSpd(ms, el) {
+    simSpeed = ms;
+    document.querySelectorAll('.btn').forEach(b => { if (b.textContent === 'slow' || b.textContent === 'normal' || b.textContent === 'fast') b.classList.remove('active'); });
+    el.classList.add('active');
+    if (simRunning) { clearInterval(simTimer); simTimer = setInterval(runStep, simSpeed); }
+  }
+
+  // init agent display
+  updateAgents(step(0));
+
+  // ── RESULTS CHARTS ───────────────────────────────────────────────
+  let resultsInited = false;
+  function initResults() {
+    if (resultsInited) return; resultsInited = true;
+    const gc = c => ({ color: c });
+    const tOpts = { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#5a5856', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.04)' } }, y: { ticks: { color: '#5a5856', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.04)' } } } };
+
+    new Chart(document.getElementById('seed-chart').getContext('2d'), {
+      type: 'bar',
+      data: { labels: ['Seed 0', 'Seed 7', 'Seed 13', 'Seed 21', 'Seed 42'], datasets: [{ data: [1004.23, 937.02, 966.46, 1120.04, 989.68], backgroundColor: ['#1D9E75', '#5DCAA5', '#1D9E75', '#085041', '#1D9E75'], borderWidth: 0 }] },
+      options: { ...tOpts, scales: { x: tOpts.scales.x, y: { ...tOpts.scales.y, min: 800, max: 1200, title: { display: true, text: 'kWh', color: '#5a5856', font: { size: 10 } } } }, plugins: { legend: { display: false }, annotation: {} } }
+    });
+
+    const steps = [50, 100, 150, 200, 250, 300];
+    const rewards = [-12.37, -10.41, -6.91, -7.89, -12.85, 133.89];
+    const colors = ['#E24B4A', '#E24B4A', '#E24B4A', '#E24B4A', '#E24B4A', '#1D9E75'];
+    new Chart(document.getElementById('conv-chart').getContext('2d'), {
+      type: 'line',
+      data: { labels: steps.map(s => s + 'k'), datasets: [{ data: rewards, borderColor: colors, borderWidth: 2, pointBackgroundColor: colors, pointRadius: 4, fill: false, tension: 0.2, segment: { borderColor: ctx => ctx.p1DataIndex === 5 ? '#1D9E75' : '#E24B4A' } }] },
+      options: { ...tOpts, plugins: { legend: { display: false } } }
+    });
+
+    const agNames = ['Solar', 'Wind', 'EV/V2G', 'Std'];
+    new Chart(document.getElementById('nash-before').getContext('2d'), {
+      type: 'bar',
+      data: { labels: agNames, datasets: [{ label: '% selling', data: [98, 100, 100, 100], backgroundColor: '#E24B4A80', borderColor: '#E24B4A', borderWidth: 1 }] },
+      options: { ...tOpts, scales: { x: tOpts.scales.x, y: { ...tOpts.scales.y, min: 0, max: 110, title: { display: true, text: '% steps selling', color: '#5a5856', font: { size: 10 } } } } }
+    });
+    new Chart(document.getElementById('nash-after').getContext('2d'), {
+      type: 'bar',
+      data: { labels: agNames, datasets: [{ label: '% selling', data: [60, 55, 30, 50], backgroundColor: '#1D9E7580', borderColor: '#1D9E75', borderWidth: 1 }] },
+      options: { ...tOpts, scales: { x: tOpts.scales.x, y: { ...tOpts.scales.y, min: 0, max: 110, title: { display: true, text: '% steps selling', color: '#5a5856', font: { size: 10 } } } } }
+    });
+  }
+
+  // ── COMPARISON ───────────────────────────────────────────────────
+  let cmpInited = false;
+  function initComparison() { cmpInited = true; }
+
+  // ── SCALABILITY ──────────────────────────────────────────────────
+  let scaleInited = false;
+  function initScale() {
+    if (scaleInited) return; scaleInited = true;
+    new Chart(document.getElementById('scale-chart').getContext('2d'), {
+      type: 'bar',
+      data: { labels: ['N = 4', 'N = 6', 'N = 8', 'N = 10'], datasets: [{ data: [63.66, 71.12, 82.45, 94.20], backgroundColor: ['#5DCAA5', '#1D9E75', '#0F6E56', '#085041'], borderWidth: 0 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { ticks: { color: '#5a5856', font: { size: 12 } }, grid: { color: 'rgba(255,255,255,0.04)' } }, y: { min: 50, ticks: { color: '#5a5856', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.04)' }, title: { display: true, text: 'kWh per agent', color: '#5a5856', font: { size: 10 } } } } }
+    });
+  }
+
+  // ── SAFETY ───────────────────────────────────────────────────────
+  let safetyInited = false;
+  function initSafety() {
+    if (safetyInited) return; safetyInited = true;
+    const tOpts = { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#9a9890', font: { size: 11 }, boxWidth: 12 } } }, scales: { x: { ticks: { color: '#5a5856', font: { size: 10 }, maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,0.04)' } }, y: { ticks: { color: '#5a5856', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.04)' } } } };
+
+    const eps = Array.from({ length: 60 }, (_, i) => i * 5);
+    new Chart(document.getElementById('lambda-chart').getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: eps.map(e => e + 'k'), datasets: [
+          { label: 'λ_SoC', data: eps.map(e => e < 10 ? 0.1 + e * 0.08 : e < 30 ? 0.9 - (e - 10) * 0.03 : Math.max(0.28, 0.3 + 0.02 * Math.sin(e * 0.3))), borderColor: '#E24B4A', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.4 },
+          { label: 'λ_line', data: eps.map(e => e < 15 ? 0.1 + e * 0.04 : Math.max(0.08, 0.7 - (e - 15) * 0.025)), borderColor: '#378ADD', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.4 },
+          { label: 'λ_voltage', data: eps.map(e => e < 8 ? 0.1 + e * 0.03 : Math.max(0.05, 0.34 - (e - 8) * 0.01)), borderColor: '#1D9E75', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.4 },
+        ]
+      },
+      options: { ...tOpts, scales: { ...tOpts.scales, y: { ...tOpts.scales.y, title: { display: true, text: 'λ value', color: '#5a5856', font: { size: 10 } } } } }
+    });
+
+    const hrs = Array.from({ length: 24 }, (_, i) => i);
+    new Chart(document.getElementById('soc-chart').getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: hrs.map(h => h + ':00'), datasets: [
+          { label: 'Solar', data: hrs.map(h => 40 + 30 * Math.sin((h - 6) * Math.PI / 12) * (h >= 6 && h <= 18 ? 1 : 0)), borderColor: '#EF9F27', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
+          { label: 'Wind', data: hrs.map(h => 50 + 20 * Math.cos(h * Math.PI / 12)), borderColor: '#378ADD', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
+          { label: 'EV/V2G', data: hrs.map(h => h < 8 ? 70 : h < 17 ? 30 : 30 + 5 * (h - 17)), borderColor: '#1D9E75', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
+          { label: 'Standard', data: hrs.map(h => 45 + 15 * Math.sin(h * Math.PI / 16)), borderColor: '#888780', borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.3 },
+        ]
+      },
+      options: { ...tOpts, scales: { x: tOpts.scales.x, y: { ...tOpts.scales.y, min: 0, max: 100, ticks: { ...tOpts.scales.y.ticks, callback: v => v + '%' }, title: { display: true, text: 'SoC (%)', color: '#5a5856', font: { size: 10 } } } } }
+    });
+  }
+</script>
+</body>
+
+</html> -->

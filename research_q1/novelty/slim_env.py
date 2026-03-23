@@ -49,6 +49,13 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         self.alpha_p2p = alpha_p2p
         self.base_delta = base_delta
         
+        # ── Fix 1: P2P completion bonus weight ($/kWh for any cleared P2P trade) ──
+        self.p2p_bonus_per_unit = 0.15  # default; overridden by CurriculumCallback
+        # ── Fix 2: Role-diversity penalty weight ($ per idle seller/buyer) ────────
+        self.no_buyer_penalty_weight = 0.10
+        # Grid penalty weight for beta_grid term
+        self.grid_penalty_weight = 0.01
+        
         # Initialize Safety Filters (always create, conditionally apply)
         self.safety_filters = []
         for node in self.nodes:
@@ -74,18 +81,38 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         n_type = 4
         n_forecast = 2 * self.forecast_horizon
         n_peer = 1
+        # Fix 3: +1 for the shared market_balance scalar appended at end of obs
+        n_market_balance = 1
         
         obs_features = n_total_base + n_weather + n_type + n_forecast + n_peer
+        # Total obs = per-agent features * n_agents + 1 shared market_balance signal
+        self.obs_features_per_agent = obs_features
         self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(self.n_agents * obs_features,),
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.n_agents * obs_features + n_market_balance,),
             dtype=np.float32
         )
 
         # Tracking
         self.safety_violations = 0
         self.accumulated_profit = 0.0
+
+    def set_reward_weights(self, p2p_bonus: float = 0.15,
+                           no_buyer_penalty: float = 0.10,
+                           grid_penalty: float = 0.01):
+        """
+        Dynamically update reward shaping weights.
+        Called by CurriculumCallback via env_method() at training milestones.
+
+        Args:
+            p2p_bonus        $/kWh bonus for any cleared P2P trade (Fix 1)
+            no_buyer_penalty $/idle-seller penalty when market has no buyers (Fix 2)
+            grid_penalty     coefficient for the raw grid-import penalty in shaped reward
+        """
+        self.p2p_bonus_per_unit = float(p2p_bonus)
+        self.no_buyer_penalty_weight = float(no_buyer_penalty)
+        self.grid_penalty_weight = float(grid_penalty)
 
     def reset(self, seed=None, options=None):
         out = super().reset(seed=seed, options=options)
@@ -178,6 +205,14 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
     def _get_obs(self, total_export, total_import):
         """
         Override to support arbitrary N agents (Scalable).
+
+        Fix 3: Appends a single shared `market_balance` scalar at the end of
+        the flattened observation vector.
+          market_balance = (total_pv_generation - total_demand) / (total_demand + 1e-6)
+          Positive  → community surplus  (market needs buyers)
+          Negative  → community deficit  (market needs sellers)
+        This gives the GNN a direct signal to self-organise complementary roles.
+        obs_dim: n_agents * obs_features_per_agent + 1  (104 + 1 = 105 for N=4, H=4)
         """
         # Calculate derived features
         hour = (self.current_idx % 24)
@@ -191,6 +226,12 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         
         # Calculate Peer Demand
         current_net_loads = generations - demands 
+        
+        # Fix 3: Community-level market balance signal
+        total_generation = np.sum(generations)
+        total_demand_sum = np.sum(demands)
+        market_balance = (total_generation - total_demand_sum) / (total_demand_sum + 1e-6)
+        market_balance = float(np.clip(market_balance, -3.0, 3.0))  # bounded
         
         # Normalize features roughly
         weather_norm = weather / [40.0, 20.0] 
@@ -238,7 +279,7 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
                 self.liquidity_pool.last_prices["buyer_price"] / 0.5
             ]
             
-            # Concatenate
+            # Concatenate per-agent features
             full_obs = np.concatenate([
                 base,
                 weather_norm,
@@ -248,6 +289,9 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             ])
             
             obs_list.extend(full_obs)
+        
+        # Fix 3: Append shared market_balance at the very end
+        obs_list.append(market_balance)
         
         return np.array(obs_list, dtype=np.float32)
 
@@ -401,15 +445,40 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             financial_profit = p2p_profit + grid_rev - grid_cost
             
             # Explicit Reward Shaping (Incentivize P2P, gentle grid penalty)
-            # beta_grid is LOW (0.01) so agents prefer P2P but won't trade at huge losses just to avoid grid
-            beta_grid = 0.01
-            
+            # grid_penalty_weight is adjustable by CurriculumCallback
             agent_p2p_vol = abs(cleared_p2p[i])
-            shaped_reward = financial_profit + (self.alpha_p2p * agent_p2p_vol) - (beta_grid * actual_grid_import)
+            shaped_reward = (financial_profit
+                             + (self.alpha_p2p * agent_p2p_vol)
+                             - (self.grid_penalty_weight * actual_grid_import))
+            
+            # ── Fix 1: P2P Completion Bonus (both buyer and seller) ──────────────
+            # Rewarding the act of clearing a trade (not just the financial outcome)
+            # makes BUYING explicitly rewarding, breaking the all-seller equilibrium.
+            if agent_p2p_vol > 0.01:
+                p2p_completion_bonus = agent_p2p_vol * self.p2p_bonus_per_unit
+                shaped_reward += p2p_completion_bonus
             
             rewards[i] = shaped_reward
             self.accumulated_profit += financial_profit
         
+        # ── Fix 2: Role Diversity Penalty ────────────────────────────────────────
+        # Penalise timesteps where the market has only sellers or only buyers,
+        # because a one-sided market clears zero P2P trades.
+        n_sellers = int(np.sum(cleared_p2p > 0.01))
+        n_buyers  = int(np.sum(cleared_p2p < -0.01))
+        diversity_penalty = 0.0
+
+        if n_sellers > 0 and n_buyers == 0:
+            # All agents are selling – nobody to trade with
+            diversity_penalty = self.no_buyer_penalty_weight * n_sellers
+            rewards -= diversity_penalty / self.n_agents  # spread penalty over agents
+        elif n_buyers > 0 and n_sellers == 0:
+            # All agents are buying – nobody to supply them
+            diversity_penalty = self.no_buyer_penalty_weight * n_buyers
+            rewards -= diversity_penalty / self.n_agents
+
+        total_reward_scalar = float(np.sum(rewards))
+
         # Global State Updates
         self.current_idx += 1
         self.timestep_count += 1
@@ -426,6 +495,12 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
         # Observation
         obs = self._get_obs(total_export, total_import)
         
+        # Per-agent bonus tracking for TensorBoard
+        step_p2p_bonus = sum(
+            abs(cleared_p2p[i]) * self.p2p_bonus_per_unit
+            for i in range(self.n_agents) if abs(cleared_p2p[i]) > 0.01
+        )
+
         info = {
             'p2p_volume': p2p_vol,
             'grid_import': total_import,
@@ -434,8 +509,14 @@ class EnergyMarketEnvSLIM(EnergyMarketEnvRecovery):
             'buyer_price': buyer_price,
             'delta': delta,
             'profit': self.accumulated_profit,
-            'safety_violations': self.safety_violations
+            'safety_violations': self.safety_violations,
+            # ── Metrics for TensorBoard ──────────────────────────────────────────
+            'reward/p2p_bonus': step_p2p_bonus,
+            'reward/no_buyer_penalty': diversity_penalty,
+            'market/n_buyers': n_buyers,
+            'market/n_sellers': n_sellers,
+            'market/p2p_volume': p2p_vol,
         }
         
-        return obs, np.sum(rewards), done, truncated, info
+        return obs, total_reward_scalar, done, truncated, info
 
