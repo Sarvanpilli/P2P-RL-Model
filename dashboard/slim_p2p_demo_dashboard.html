@@ -153,12 +153,44 @@
     }
 
     /* Agent Cards */
-    .agent-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 15px; }
-    .a-card { background: rgba(128,128,128,0.05); padding: 12px; border-radius: 8px; border: 1px solid var(--border); }
-    .a-header { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 12px; }
-    .a-stat { font-size: 10px; color: var(--muted); }
-    .soc-track { height: 4px; background: rgba(0,0,0,0.1); border-radius: 2px; margin-top: 4px; overflow: hidden; }
-    .soc-fill { height: 100%; transition: width 0.3s; }
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 15px;
+    }
+
+    .a-card {
+      background: rgba(128, 128, 128, 0.05);
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .a-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+
+    .a-stat {
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .soc-track {
+      height: 4px;
+      background: rgba(0, 0, 0, 0.1);
+      border-radius: 2px;
+      margin-top: 4px;
+      overflow: hidden;
+    }
+
+    .soc-fill {
+      height: 100%;
+      transition: width 0.3s;
+    }
 
     /* Components */
     .chart-box {
@@ -315,7 +347,7 @@
   <div id="live" class="page active">
     <div class="metric-row">
       <div class="metric">
-        <div class="m-label">P2P Volume</div>
+        <div class="m-label">P2P Energy Trading Volume</div>
         <div class="m-value" id="m-p2p" style="color:var(--green)">0 kWh</div>
         <div class="m-sub">Verified: 992.77 ± 60.47 kWh</div>
       </div>
@@ -353,7 +385,8 @@
           <button class="nav-btn" onclick="toggleSim()" id="runBtn"
             style="color:white;background:var(--blue);border:none">Run episode</button>
           <button class="nav-btn" onclick="resetSim()">Reset</button>
-          <select id="simSpeed" class="nav-btn" style="appearance: none; -webkit-appearance: none; background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgdmlld0JveD0iMCAwIDEwIDEwIj48cGF0aCBmaWxsPSIjODg4IiBkPSJNNSA3LjVMLjUgMy41aDlsLTQuNSA0eiIvPjwvc3ZnPg=='); background-repeat: no-repeat; background-position: right 8px center; padding-right: 24px;">
+          <select id="simSpeed" class="nav-btn"
+            style="appearance: none; -webkit-appearance: none; background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgdmlld0JveD0iMCAwIDEwIDEwIj48cGF0aCBmaWxsPSIjODg4IiBkPSJNNSA3LjVMLjUgMy41aDlsLTQuNSA0eiIvPjwvc3ZnPg=='); background-repeat: no-repeat; background-position: right 8px center; padding-right: 24px;">
             <option value="500">🐌 Slow</option>
             <option value="150" selected>⚡ Normal</option>
             <option value="50">🚀 Fast</option>
@@ -522,7 +555,7 @@
       document.getElementById('comparison').classList.remove('active');
       document.getElementById('scalability').classList.remove('active');
       document.getElementById('safety').classList.remove('active');
-      
+
       document.getElementById(id).classList.add('active');
       btn.classList.add('active');
       initCharts(id);
@@ -537,28 +570,28 @@
     ];
 
     let simStep = 0, running = false, p2pAcc = 0, gridAcc = 0;
-    
+
     function getStepData(step) {
       const h = step % 24;
       const profiles = {
-        solar: { gen: (h > 6 && h < 18) ? 5.2 * Math.sin((h - 6) * Math.PI / 12) : 0, dem: 1.1 + Math.random()*0.3 },
-        wind: { gen: 2.1 + 0.8 * Math.sin(h * Math.PI / 10), dem: 0.7 + Math.random()*0.2 },
+        solar: { gen: (h > 6 && h < 18) ? 5.2 * Math.sin((h - 6) * Math.PI / 12) : 0, dem: 1.1 + Math.random() * 0.3 },
+        wind: { gen: 2.1 + 0.8 * Math.sin(h * Math.PI / 10), dem: 0.7 + Math.random() * 0.2 },
         ev: { gen: (h < 7 || h > 21) ? 1.5 : 0, dem: (h >= 17 && h <= 21) ? 4.8 : 0.6 },
         std: { gen: 0, dem: 1.8 + 1.2 * Math.sin(h * Math.PI / 24) }
       };
-      
+
       let buyers = 0;
       const agents = AGENT_META.map(m => {
         const p = profiles[m.id];
         const net = p.gen - p.dem;
         if (net < -0.1) buyers++;
-        return { ...m, ...p, net, soc: 0.3 + 0.6 * Math.random() }; 
+        return { ...m, ...p, net, soc: 0.3 + 0.6 * Math.random() };
       });
 
       const sellersTot = agents.filter(a => a.net > 0).reduce((s, a) => s + a.net, 0);
       const buyersTot = agents.filter(a => a.net < 0).reduce((s, a) => s - a.net, 0);
-      const matched = Math.min(sellersTot, buyersTot) * (0.85 + Math.random()*0.05); // SLIM v2 Efficiency
-      
+      const matched = Math.min(sellersTot, buyersTot) * (0.85 + Math.random() * 0.05); // SLIM v2 Efficiency
+
       return { agents, matched, buyers, grid: Math.max(0, buyersTot - sellersTot) };
     }
 
@@ -578,7 +611,7 @@
       updateUI(data);
       simStep++;
       const speed = parseInt(document.getElementById('simSpeed').value) || 150;
-      setTimeout(tick, speed); 
+      setTimeout(tick, speed);
     }
 
     function stopSim() {
@@ -601,7 +634,7 @@
       document.getElementById('m-buyers').innerText = data.buyers;
       document.getElementById('step-h').innerText = simStep;
       document.getElementById('p-fill').style.width = (simStep / 168 * 100) + '%';
-      
+
       const grid = document.getElementById('agentGrid');
       grid.innerHTML = data.agents.map(a => `
         <div class="a-card">
@@ -609,8 +642,8 @@
             <span><b>${a.name}</b></span>
             <span class="badge ${a.net > 0 ? 'b-green' : 'b-blue'}">${a.net > 0 ? 'Selling' : 'Buying'}</span>
           </div>
-          <div class="a-stat">Net: ${a.net.toFixed(2)} kW | SoC: ${(a.soc*100).toFixed(0)}%</div>
-          <div class="soc-track"><div class="soc-fill" style="width:${a.soc*100}%; background:${a.color}"></div></div>
+          <div class="a-stat">Net: ${a.net.toFixed(2)} kW | SoC: ${(a.soc * 100).toFixed(0)}%</div>
+          <div class="soc-track"><div class="soc-fill" style="width:${a.soc * 100}%; background:${a.color}"></div></div>
         </div>
       `).join('');
 
@@ -629,11 +662,14 @@
       const ctx = document.getElementById('liveChart');
       if (!charts.live) {
         charts.live = new Chart(ctx, {
-          type: 'bar', data: { labels: [], datasets: [
+          type: 'bar', data: {
+            labels: [], datasets: [
               { label: 'P2P', data: [], backgroundColor: '#10b981' },
               { label: 'Grid', data: [], backgroundColor: '#ef444420', borderColor: '#ef4444', borderWidth: 1 }
-            ]},
-          options: { responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
+            ]
+          },
+          options: {
+            responsive: true, maintainAspectRatio: false, animation: false, plugins: { legend: { display: false } },
             scales: { x: { display: false }, y: { display: false } }
           }
         });

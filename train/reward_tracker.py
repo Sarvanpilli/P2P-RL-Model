@@ -71,10 +71,12 @@ class RewardTracker:
                              smoothing_penalties: np.ndarray = None,
                              co2_penalties: np.ndarray = None,
                              p2p_bonuses: np.ndarray = None,
-                             total_export_kw: float = 0.0) -> float:
+                             total_export_kw: float = 0.0,
+                             traded_energy: np.ndarray = None,
+                             trade_intent: np.ndarray = None) -> float:
         """
         Aggregates the core components into a scalar reward.
-        Includes new Phase 5 components: Smoothing, CO2, and P2P Bonus.
+        Includes Phase 5+ upgrades: Trade Success and Diversity Regularization.
         """
         
         # 1. Update internal state with Clipping
@@ -88,15 +90,22 @@ class RewardTracker:
         if smoothing_penalties is None: smoothing_penalties = np.zeros(self.n_agents)
         if co2_penalties is None: co2_penalties = np.zeros(self.n_agents)
         if p2p_bonuses is None: p2p_bonuses = np.zeros(self.n_agents)
+        if traded_energy is None: traded_energy = np.zeros(self.n_agents)
         
         self.step_smoothing_penalty = np.clip(smoothing_penalties, 0.0, 10.0)
         self.step_co2_penalty = np.clip(co2_penalties, 0.0, 20.0)
-        self.step_p2p_bonus = p2p_bonuses # Positive incentive, usually doesn't need clipping
+        self.step_p2p_bonus = p2p_bonuses
         
-        # 2. Compute per-agent net value (before fairness)
-        # REWARD FORMULA: Profit + Bonuses - Costs - Penalties
+        # --- NEW COMPONENTS (Phase 5 Upgrade) ---
+        # 3g. Trade Success Reward (alpha * traded_energy)
+        # alpha <= 0.5 * average_profit_per_kwh (~0.05)
+        ALPHA = 0.05
+        self.step_trade_reward = traded_energy * ALPHA
+        
+        # 2. Compute per-agent net value (before global penalties)
         per_agent_net = (self.step_profit 
                          + self.step_p2p_bonus
+                         + self.step_trade_reward
                          - self.step_grid_penalty 
                          - self.step_soc_penalty 
                          - self.step_grid_overload_penalty 
@@ -105,11 +114,21 @@ class RewardTracker:
                          - self.step_co2_penalty)
         
         # 3. Compute Fairness Penalty (Global)
+        # Reduced by 0.5 as requested to avoid over-regularization
         gini = self.compute_gini(per_agent_net)
-        self.step_fairness_penalty = self.fairness_coeff * gini * (1.0 + 0.05 * abs(total_export_kw))
+        self.step_fairness_penalty = 0.5 * self.fairness_coeff * gini * (1.0 + 0.05 * abs(total_export_kw))
         
-        # 4. Total Shared Reward
-        total_reward = np.sum(per_agent_net) - self.step_fairness_penalty
+        # 4. Diversity Regularization (gamma * var / (var + 1))
+        # Encourages agents to take different roles (buying vs selling)
+        GAMMA = 0.1
+        if trade_intent is not None:
+             var_intent = np.var(trade_intent)
+             self.step_diversity_reward = GAMMA * (var_intent / (var_intent + 1.0))
+        else:
+             self.step_diversity_reward = 0.0
+             
+        # 5. Total Shared Reward
+        total_reward = np.sum(per_agent_net) - self.step_fairness_penalty + self.step_diversity_reward
         
         return float(total_reward)
 

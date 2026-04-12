@@ -59,6 +59,7 @@ class EnergyMarketEnvRobust(gym.Env):
         self.forecast_horizon = forecast_horizon
         self.enable_predictive_obs = enable_predictive_obs
         self.forecast_noise_std = forecast_noise_std
+        self.beta = 1.0 # Default starting beta for experiments
         
         # Physics Constants
         self.max_line_capacity_kw = 50.0
@@ -136,12 +137,24 @@ class EnergyMarketEnvRobust(gym.Env):
         # + Forecast: 4 hours * (Solar + Wind + Demand) -> 2 features * H
         # History (2) was planned but not implemented in _get_obs. Removing.
         
-        n_obs_features = 7 + 2 + 4 + (2 * self.forecast_horizon)
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(n_agents * n_obs_features,), dtype=np.float32)
+        # Updated Obs Dim: 7 base + 2 weather + 4 type + 5 market + (2 * self.forecast_horizon)
+        # Total: 13 + 5 + 8 = 26 per agent (for H=4)
+        n_obs_features = 7 + 2 + 4 + 5 + (2 * self.forecast_horizon)
+        self.observation_space = spaces.Box(low=-5.0, high=5.0, shape=(n_agents * n_obs_features,), dtype=np.float32)
         
         self.current_idx = 0
         self.day_start_idx = 0
-        self.max_steps = 24 * 7 # 1 week episodes usually
+        self.max_steps = 24 * 7 
+
+        # Market State History for observations
+        from collections import deque
+        self.market_history = {
+            'prices': deque(maxlen=24),
+            'success_flags': deque(maxlen=24),
+            'last_market_price': 0.15,
+            'last_success_rate': 0.0,
+            'steps_without_trade': 0
+        }
 
         # Track prev action for smoothing
         self.prev_actions = np.zeros((n_agents, 3))
@@ -301,6 +314,12 @@ class EnergyMarketEnvRobust(gym.Env):
         # SB3 flattens actions for VecEnvs. Reshape to (N, 3)
         raw_action = action.reshape(self.n_agents, 3)
         
+        # Deadlock Breaking (Safe Exploration)
+        # If no trades for 12 steps, inject small exploratory noise
+        if self.market_history['steps_without_trade'] >= 12:
+            noise = self.rng.normal(0, 0.05, size=raw_action.shape)
+            raw_action = np.clip(raw_action + noise, -1.0, 1.0)
+            
         state_data = self._step_physics_prep(raw_action)
         
         # 2. Market
@@ -402,46 +421,33 @@ class EnergyMarketEnvRobust(gym.Env):
         # Let's assume standard 'matching_engine.match()' does Quantity matching.
         # We will wrap it with Price Check.
         
-        # Scaling Normalized Price [0, 1] to Real [0, 0.50]
-        MAX_PRICE = 0.50 # Approx grid retail max
-        real_limit_prices = bid_prices * MAX_PRICE
+        # --- STEP 1: DYNAMIC PRICING (Real Economics) ---
+        total_market_demand = np.sum(np.abs(trade_intents[trade_intents < 0]))
+        total_market_supply = np.sum(np.abs(trade_intents[trade_intents > 0]))
         
-        # We pass these to match() if we modify it, or we filter results.
-        # Let's filter: Agents only match if their limits overlap.
-        # Since standard Matching Engine is global pool, we can set a single "Clearing Price"
-        # based on aggregate Bid/Ask curves. 
-        # This is complex for 5 mins.
-        # Alternative (Prompt): "If an agent asks for a price higher than the grid price..."
-        # Let's act as if there is a 'Market Maker' that rejects bad bids.
-        # We'll use the Grid Retail/FeedIn as bounds.
-        # IF Seller Ask > Retail: No buyer would buy. Fail.
-        # IF Buyer Bid < FeedIn: No seller would sell. Fail.
+        # Refined Formula: price = base_price + k1 * (demand / (supply + eps))
+        base_p = 0.10
+        k1 = 0.05
+        eps = 1e-4
+        dynamic_price = base_p + k1 * (total_market_demand / (total_market_supply + eps))
         
-        # FILTERING:
-        valid_trade_mask = np.ones(self.n_agents, dtype=bool)
+        # Clamp to realistic bounds [0.05, 0.30]
+        dynamic_price = np.clip(dynamic_price, 0.05, 0.30)
         
-        # Sellers (Trade > 0): Ask Price = real_limit_prices
-        sellers = trade_intents > 1e-3
         retail_p, feed_in_p = self._get_grid_prices()
         
-        # Constraint 1: Sellers cannot Ask more than Grid Retail (Competition)
-        # If Ask > Retail, buyers prefer Grid.
-        violation_sell = (real_limit_prices > retail_p) & sellers
+        # Selling Constraint: Don't undercut 80% of grid Feed-In Tariff (Viability Floor)
+        # This prevents "toxic trades" where P2P price < 0.8 * Grid Sale price
+        SELLER_FLOOR = 0.8 * feed_in_p
         
-        # Constraint 2: Buyers cannot Bid less than Feed-In (Competition)
-        # If Bid < FeedIn, sellers prefer Grid.
-        buyers = trade_intents < -1e-3
-        violation_buy = (real_limit_prices < feed_in_p) & buyers
+        real_limit_prices = np.zeros(self.n_agents)
+        for i in range(self.n_agents):
+            if trade_intents[i] > 0: # Seller
+                real_limit_prices[i] = max(dynamic_price, SELLER_FLOOR)
+            else: # Buyer
+                real_limit_prices[i] = dynamic_price
         
-        # Apply Failures
-        trade_intents[violation_sell] = 0.0
-        trade_intents[violation_buy] = 0.0
-        
-        # Record Failed Trades for Reward?
-        failed_count = np.sum(violation_sell) + np.sum(violation_buy)
-        
-        # Pass filtered trades to Matching Engine
-        # Must be (N, 2) array: [Quantity, Price]
+        # Pass trades to Matching Engine
         bids_input = np.stack([trade_intents, real_limit_prices], axis=1)
         
         trades, market_price, net_grid_flow, match_info = self.matching_engine.match(
@@ -450,12 +456,30 @@ class EnergyMarketEnvRobust(gym.Env):
             grid_sell_price=feed_in_p
         )
         
+        # New matching engine handles everythinginternally
+        failed_count = 0 
+        
+        # Update market history
+        if market_price > 0:
+            self.market_history['last_market_price'] = market_price
+            self.market_history['prices'].append(market_price)
+            
+        success = float(match_info['total_volume'] > 1e-3)
+        self.market_history['success_flags'].append(success)
+        self.market_history['last_success_rate'] = np.mean(self.market_history['success_flags']) if self.market_history['success_flags'] else 0.0
+        
+        if success > 0:
+            self.market_history['steps_without_trade'] = 0
+        else:
+            self.market_history['steps_without_trade'] += 1
+            
         return {
             'trades': trades,
             'market_price': market_price,
             'bids_processed': bids_input,
-            'failed_trades_count': failed_count, # New metric
+            'failed_trades_count': failed_count, 
             'bid_prices': real_limit_prices,
+            'trade_intents': trade_intents,
             'match_info': match_info
         }
 
@@ -465,14 +489,13 @@ class EnergyMarketEnvRobust(gym.Env):
         co2 = physics_state['co2'] # Carbon intensity
         node_results = physics_state['node_results']
         safe_action = physics_state['safe_action']
+        retail_p, feed_in_p = self._get_grid_prices()
         
-        # 1. Economic Coefficients (Rebalanced Task)
-        # Grid penalty is capped at 0.15 to stay below the P2P profit margin of $0.10–0.40/kWh.
-        GRID_PENAL_COEFF = 0.15
-        SMOOTHING_COEFF = 0.05
-        CO2_PENAL_COEFF = 0.10
-        P2P_BONUS_COEFF = 0.20
-        # self.overload_multiplier (already set to 5.0 in __init__)
+        # 1. Economic Coefficients (Optimized for P2P Growth)
+        GRID_PENAL_COEFF = self.beta # Tunable Beta from Experiments
+        SMOOTHING_COEFF = 0.02 
+        CO2_PENAL_COEFF = 0.15 
+        P2P_BONUS_COEFF = 0.05 
 
         # 2. Grid & P2P Analysis
         # Ground Truth: Each agent's net physical requirement
@@ -555,17 +578,41 @@ class EnergyMarketEnvRobust(gym.Env):
         soc_penalty = (socs_final - 50.0)**2 * 0.001
         battery_wear_cost = throughputs * 0.05
         
+        # 3g. Battery Strategy Shaping (Real-Time Optimization)
+        hour = (self.current_idx % 24)
+        is_peak = (17 <= hour < 21)
+        batt_reward = np.zeros(self.n_agents)
+        BATT_WEIGHT = 0.02 # Small auxiliary signal
+        
+        for i in range(self.n_agents):
+            net_node = physics_state['pvs'][i] - physics_state['demands'][i]
+            # --- STEP 3: BATTERY SUPPORT (Light Shaping) ---
+            # Charging bonus when generation > demand
+            if net_node > 0 and safe_action[i, 0] > 0.1:
+                batt_reward[i] += 0.01 # Small bonus
+            # Discharging bonus during peak hours (17-21)
+            if is_peak and safe_action[i, 0] < -0.1:
+                batt_reward[i] += 0.02 # Slightly higher peak bonus
+            
+            # --- STEP 1: BUYER RATIONALITY (Preference Weighting) ---
+            # Apply 0.5x penalty if buying P2P at price > Grid Retail
+            trade_intents = market_results.get('trade_intents', np.zeros(self.n_agents))
+            if trade_intents[i] < -1e-6 and market_results['market_price'] > retail_p:
+                batt_reward[i] -= 0.05 # Discourage irrational P2P buys
+        
         # 4. Final Aggregation
         reward = self.reward_tracker.calculate_total_reward(
             profits=trades * market_price,
             grid_import_penalties=grid_import_penalty,
             soc_penalties=soc_penalty,
             grid_overload_costs=overload_penalty_agent,
-            battery_costs=battery_wear_cost,
+            battery_costs=battery_wear_cost + battery_wear_cost - batt_reward, # subtract reward from cost
             smoothing_penalties=smoothing_penalty,
             co2_penalties=co2_penalty,
             p2p_bonuses=p2p_bonus,
-            total_export_kw=total_export
+            total_export_kw=total_export,
+            traded_energy=np.abs(p2p_agent_trades),
+            trade_intent=safe_action[:, 1]
         )
         
         # --- LAGRANGIAN SAFETY PENALTY ---
@@ -587,8 +634,8 @@ class EnergyMarketEnvRobust(gym.Env):
         lagrangian_penalty = self.lagrangian.compute_penalty(lagrangian_violations)
         self.lagrangian.record_step(lagrangian_violations)
 
-        # Subtract Lagrangian penalty from total reward
-        reward = reward - lagrangian_penalty
+        # Subtract Lagrangian penalty from total reward (Reduced weight)
+        reward = reward - 0.5 * lagrangian_penalty
 
         # Add to info dict for TensorBoard logging (will be updated below)
         # --- END LAGRANGIAN ---
@@ -596,9 +643,19 @@ class EnergyMarketEnvRobust(gym.Env):
         # 5. Logging and Info Update
         profit_breakdown = self.reward_tracker.get_profit_breakdown()
         
-        # absolute_profit_usd: real-world USD balance
-        # gross_profit + bonuses - all penalty terms
-        absolute_profit_usd = profit_breakdown['gross_profit'] + np.sum(p2p_bonus) - profit_breakdown['total_penalties']
+        # --- SCIENTIFIC METRIC BIFURCATION (User Request) ---
+        market_price = market_results.get('market_price', 0.15)
+        revenue_p2p = total_p2p_volume * market_price
+        cost_grid = np.sum(grid_import_kwh * retail_p)
+        
+        market_profit_usd = float(revenue_p2p - cost_grid)
+        
+        # 2. Economic Profit: Market Profit - Battery Depreciation
+        total_battery_depreciation = np.sum(battery_wear_cost)
+        economic_profit_usd = float(market_profit_usd - total_battery_depreciation)
+        
+        # 3. Consumption tracking
+        total_demand_kw = float(np.sum(physics_state['demands']))
 
         self.prev_actions = safe_action.copy()
         r_info = self.reward_tracker.get_info()
@@ -610,7 +667,11 @@ class EnergyMarketEnvRobust(gym.Env):
             "grid_capacity_limit": self.max_line_capacity_kw,
             "line_overload_kw": line_overload_kw,
             "p2p_volume_kwh_step": total_p2p_volume * self.timestep_hours,
-            "absolute_profit_usd": absolute_profit_usd,
+            "total_demand_kw": float(total_demand_kw),
+            "grid_import_kwh": float(np.sum(grid_import_kwh)),
+            "carbon_intensity": co2,
+            "market_profit_usd": market_profit_usd,
+            "economic_profit_usd": economic_profit_usd,
             "profit_breakdown": profit_breakdown,
             **r_info,
             **physics_state["guard_info"],
@@ -682,9 +743,21 @@ class EnergyMarketEnvRobust(gym.Env):
             base = [
                 soc_norm, retail_norm, feed_in_norm, 
                 sin_time, cos_time,
-                np.clip(total_export/50.0, 0, 1), 
-                np.clip(total_import/50.0, 0, 1)
+                np.clip(total_export/50.0, -1, 1), 
+                np.clip(total_import/50.0, -1, 1)
             ]
+            
+            # 2. Market Features (5) - Locally Normalized
+            # [avg_p, n_buyers, n_sellers, success_rate, last_p]
+            raw_market = np.array([
+                np.mean(self.market_history['prices']) if self.market_history['prices'] else 0.15,
+                np.sum(dem > gen + 0.1),
+                np.sum(gen > dem + 0.1),
+                self.market_history['last_success_rate'],
+                self.market_history['last_market_price']
+            ])
+            # Normalize market features (approximate mean/std)
+            market_norm = (raw_market - np.array([0.15, 2.0, 2.0, 0.5, 0.15])) / np.array([0.05, 1.0, 1.0, 0.5, 0.05])
             
             # Weather (2)
             # Assuming weather is normalized or small
@@ -718,7 +791,7 @@ class EnergyMarketEnvRobust(gym.Env):
                      forecasts.extend([f_dem, f_gen])
             
             # Concatenate
-            full_obs = np.concatenate([base, weather_norm, type_vec, forecasts])
+            full_obs = np.concatenate([base, weather_norm, type_vec, market_norm, forecasts])
             obs_list.extend(full_obs)
             
         return np.array(obs_list, dtype=np.float32)
