@@ -62,9 +62,9 @@ class MatchingEngine:
         current_buy_orders = [b.copy() for b in buy_orders]
         
         # 2. Match Pairs based on Spread (Greedy Volume Maximization)
-        # PRIORITIZING SMALLEST SPREADS (User Request)
-        # Updated to 0.08 for Improved Grid Reduction scaling
-        EPSILON = 0.08
+        # PRIORITIZING TIGHTEST SPREADS FIRST (Scientific Request)
+        # Updated to 0.10 for Advanced Performance Scaling
+        EPSILON = 0.10
         # To do this correctly, we find all possible valid pairs (spread >= -EPSILON)
         # and sort them so that the most "competitive" (marginal) trades go first.
         
@@ -82,7 +82,7 @@ class MatchingEngine:
                         's_ord': s
                     })
         
-        # Sort by spread (ascending) to prioritize smallest spreads
+        # Sort by absolute spread (ascending) to prioritize tightest matchups first
         possible_pairs.sort(key=lambda x: abs(x['spread']))
         
         trades = np.zeros(len(bids), dtype=float)
