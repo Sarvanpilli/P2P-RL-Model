@@ -1,4 +1,5 @@
 
+# dashboard.py
 import streamlit as st
 import json
 import pandas as pd
@@ -8,10 +9,8 @@ import plotly.express as px
 
 st.set_page_config(page_title="SLIM Real-Time Energy Market", layout="wide")
 
-st.title("⚡ SLIM v3: Scientific P2P Market Monitor")
-st.markdown("Monitoring live energy transactions with scientific integrity. Metrics reflect corrected supply-demand economics.")
-
 STATS_FILE = "live_market_stats.json"
+CONFIG_FILE = "simulation_config.json"
 
 def load_data():
     if os.path.exists(STATS_FILE):
@@ -22,12 +21,37 @@ def load_data():
                 return None
     return None
 
-placeholder = st.empty()
+def update_config(dataset):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"dataset": dataset}, f)
 
-# Interactive Controls (Outside Loop)
-st.sidebar.title("Controls")
+# --- SIDEBAR CONTROLS ---
+st.sidebar.title("⚡ SLIM v4 Controls")
+dataset_choice = st.sidebar.selectbox(
+    "Select Region / Dataset",
+    ["hybrid", "ausgrid"],
+    index=0,
+    help="Switching datasets will hot-reload the simulation environment."
+)
+
+# Sync configuration
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        try:
+            current_config = json.load(f)
+        except:
+            current_config = {}
+    if current_config.get("dataset") != dataset_choice:
+        update_config(dataset_choice)
+        st.toast(f"🔄 Swapping dataset to {dataset_choice.upper()}...", icon="🚀")
+else:
+    update_config(dataset_choice)
+
+st.sidebar.divider()
 show_raw = st.sidebar.checkbox("Show Raw Live Data", key="show_raw_data")
-refresh_rate = st.sidebar.slider("Refresh Rate (s)", 0.5, 5.0, 1.0)
+refresh_rate = st.sidebar.slider("Refresh Rate (s)", 0.5, 5.0, 0.5)
+
+placeholder = st.empty()
 
 while True:
     data = load_data()
@@ -35,6 +59,17 @@ while True:
     with placeholder.container():
         if data:
             curr_step = data['history'][-1]['step'] if data['history'] else 0
+            sim_hour = data.get('sim_hour', 0)
+            
+            # --- HEADER ---
+            col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
+            with col_h1:
+                st.title("⚡ SLIM v4: Smart P2P Market Monitor")
+            with col_h2:
+                # Simulation Clock (High Visibility)
+                st.metric("Simulation Time", f"{sim_hour:02d}:00", delta="Live Clock")
+            with col_h3:
+                st.markdown(f"### 🧪 Dataset: :blue[[{data.get('dataset_type', 'UNKNOWN')}]]")
             
             # Row 1: Economic Performance
             st.header("1. Economic Performance")
@@ -43,7 +78,6 @@ while True:
             m1.metric("Market Profit", f"${data['cumulative_market_profit']:.2f}", 
                       delta=f"${data['history'][-1]['profit']:.2f} (Instant)")
             
-            # Economic Profit (Market - Degradation)
             m2.metric("Economic Profit", f"${data['cumulative_economic_profit']:.2f}",
                       help="Net profit after accounting for battery degradation and wear.")
             
@@ -59,7 +93,6 @@ while True:
             
             with c1:
                 st.subheader("Grid Dependency (Rolling 50-Step)")
-                # Gauge-like area chart for dependency
                 history_df = pd.DataFrame(data['history'])
                 chart_key_g = f"grid_dep_chart_{curr_step}_{time.time()}"
                 fig_g = px.area(history_df, x='step', y='grid_dep', 
@@ -70,8 +103,7 @@ while True:
                 
             with c2:
                 st.subheader("Lifetime Stats")
-                st.write(f"**Cumulative Dependency:** {data['cumulative_grid_dependency']:.1f}%")
-                # Carbon Reduction calculation (Relative to baseline)
+                st.write(f"**Avg Grid Dependency:** {data['cumulative_grid_dependency']:.1f}%")
                 reduction = 0
                 if data['cumulative_baseline_co2'] > 0:
                     reduction = (data['cumulative_baseline_co2'] - data['cumulative_co2']) / data['cumulative_baseline_co2'] * 100
@@ -92,7 +124,6 @@ while True:
                             color_discrete_sequence=['#00CC96'])
             st.plotly_chart(fig_v, use_container_width=True, key=chart_key_v)
 
-            # Raw Data View
             if show_raw:
                 st.divider()
                 st.subheader("Raw Live Data Stream")

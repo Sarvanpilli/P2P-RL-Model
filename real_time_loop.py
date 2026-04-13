@@ -1,103 +1,131 @@
 
+# real_time_loop.py
 import os
 import sys
 import time
 import json
-import requests
+import argparse
 import numpy as np
 from datetime import datetime
+from stable_baselines3 import PPO
+from collections import deque
 
 # Custom modules
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from train.energy_env_robust import EnergyMarketEnvRobust
 
-API_URL = "http://127.0.0.1:8000/predict"
 STATS_FILE = "live_market_stats.json"
+MODEL_PATH = "models_scalable_v5/ppo_n16_v5.zip"
 
-def run_real_time():
-    print("Starting Real-Time Simulation Loop (Streaming Data)...")
-    
-    # Init Env
-    env = EnergyMarketEnvRobust(
-        n_agents=4, 
-        data_file="processed_hybrid_data.csv",
-        random_start_day=True,
-    )
-    
-    # Load Baseline to compare reduction
-    baseline_stats = {}
-    if os.path.exists("research_q1/results/carbon_baseline.json"):
-        with open("research_q1/results/carbon_baseline.json", "r") as f:
-            baseline_stats = json.load(f)
-    baseline_co2_avg = baseline_stats.get('avg_co2_per_step', 0.1)
 
-    obs, _ = env.reset()
+
+def run_real_time(dataset="hybrid"):
+    print(f"Starting SLIM v4 Live Demo on [{dataset.upper()}] dataset...")
     
-    # Persistent State for Dashboard
-    market_data = {
-        'total_p2p_volume': 0.0,
-        'cumulative_market_profit': 0.0,
-        'cumulative_economic_profit': 0.0,
-        'rolling_market_profit': 0.0,
-        'cumulative_co2': 0.0,
-        'cumulative_baseline_co2': 0.0,
-        'rolling_grid_dependency': 100.0,
-        'cumulative_grid_dependency': 100.0,
-        'trade_success_rate': 0.0,
-        'is_active': True,
-        'last_update': "",
-        'history': []
+    data_map = {
+        "hybrid": "processed_hybrid_data.csv",
+        "ausgrid": "evaluation/ausgrid_p2p_energy_dataset.csv"
     }
     
-    # Deques for rolling windows
-    from collections import deque
+    if not os.path.exists(MODEL_PATH):
+        print(f"ERROR: Model file {MODEL_PATH} not found.")
+        return
+        
+    print(f"Loading SLIM v4 Policy from {MODEL_PATH}...")
+    model = PPO.load(MODEL_PATH)
+    
+    def init_simulation(ds_name):
+        target_data = data_map.get(ds_name, "processed_hybrid_data.csv")
+        new_env = EnergyMarketEnvRobust(
+            n_prosumers=4, 
+            n_consumers=0, 
+            data_file=target_data,
+            random_start_day=True,
+        )
+        new_obs, _ = new_env.reset()
+        return new_env, new_obs
+
+    env, obs = init_simulation(dataset)
+    
+    # Initialize State
+    def reset_market_data(ds_type):
+        return {
+            'dataset_type': ds_type.upper(),
+            'total_p2p_volume': 0.0,
+            'cumulative_market_profit': 0.0,
+            'cumulative_economic_profit': 0.0,
+            'rolling_market_profit': 0.0,
+            'cumulative_co2': 0.0,
+            'cumulative_baseline_co2': 0.0,
+            'rolling_grid_dependency': 100.0,
+            'cumulative_grid_dependency': 100.0,
+            'trade_success_rate': 0.0,
+            'behavior_insight': "Initializing simulation...",
+            'sim_hour': 0,
+            'is_active': True,
+            'last_update': "",
+            'history': []
+        }
+
+    market_data = reset_market_data(dataset)
+    
+    # Rolling Data Buffers
     window_grid_imp = deque(maxlen=50)
     window_demand = deque(maxlen=50)
     window_profit = deque(maxlen=50)
     
     total_grid_energy = 0.0
     total_energy_demand = 0.0
-
     step_count = 0
+    CONFIG_FILE = "simulation_config.json"
+    
     while True:
-        try:
-            # 1. Get Action from API
-            resp = requests.post(API_URL, json={"observation": obs.tolist()}, timeout=1)
-            if resp.status_code == 200:
-                action = np.array(resp.json()['action'])
-            else:
-                print(f"API Error {resp.status_code}. Using random fallback.")
-                action = env.action_space.sample()
-        except requests.exceptions.ConnectionError:
-            print("API Offline. Retrying in 2s...")
-            time.sleep(2)
-            continue
+        # 1. Hot-Reload Check (Total Isolation)
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
+                if config.get("dataset") != dataset:
+                    dataset = config.get("dataset")
+                    print(f"\n--- DATASET SWAP DETECTED: {dataset.upper()} ---")
+                    env, obs = init_simulation(dataset)
+                    market_data = reset_market_data(dataset)
+                    window_grid_imp.clear()
+                    window_demand.clear()
+                    window_profit.clear()
+                    total_grid_energy = 0.0
+                    total_energy_demand = 0.0
+                    step_count = 0
+            except:
+                pass
 
-        # 2. Step Environment
+        # 2. Local Inference
+        action, _ = model.predict(obs, deterministic=True)
+
+        # 3. Environment Step
         obs, reward, done, truncated, info = env.step(action)
         step_count += 1
         
-        # 3. Update Stats (Scientific Corrections)
+        # 4. Simulation Time Tracking
+        sim_hour = int(env.current_idx % 24)
+        market_data['sim_hour'] = sim_hour
+        
+        # 6. Update Analytics
         p2p_v = info.get('p2p_volume_kwh_step', 0)
         market_profit = info.get('market_profit_usd', 0)
         economic_profit = info.get('economic_profit_usd', 0)
         grid_imp = info.get('grid_import_kwh', 0)
         demand = info.get('total_demand_kw', 1e-4)
-        intensity = info.get('carbon_intensity_kg_kwh', 0.5)
         
-        # Physical Consistency Checks
-        if float(grid_imp) > 0 and p2p_v == 0 and market_profit == 0:
-            print(f"CRITICAL WARNING: Grid import detected ({grid_imp:.2f}) but P2P/Profit is zero. Model might be in standby.")
-
+        intensity = 0.4
         co2_step = grid_imp * intensity
         
         market_data['total_p2p_volume'] += p2p_v
         market_data['cumulative_market_profit'] += market_profit
         market_data['cumulative_economic_profit'] += economic_profit
         market_data['cumulative_co2'] += co2_step
-        market_data['cumulative_baseline_co2'] += baseline_co2_avg
+        market_data['cumulative_baseline_co2'] += (demand * intensity) 
         
-        # Grid Dependency Calculations (Corrected formula)
         total_grid_energy += grid_imp
         total_energy_demand += demand
         market_data['cumulative_grid_dependency'] = (total_grid_energy / (total_energy_demand + 1e-9)) * 100.0
@@ -106,34 +134,37 @@ def run_real_time():
         window_demand.append(demand)
         window_profit.append(market_profit)
         
-        market_data['rolling_grid_dependency'] = (sum(window_grid_imp) / (sum(window_demand) + 1e-9)) * 100.0
+        market_data['rolling_grid_dependency'] = info.get('grid_dependency', 1.0) * 100.0
         market_data['rolling_market_profit'] = sum(window_profit)
-        
         market_data['trade_success_rate'] = env.market_history['last_success_rate']
         market_data['last_update'] = datetime.now().strftime("%H:%M:%S")
         
-        # Snapshot for charts (limit to last 50)
+        # Snapshot for Charts
         market_data['history'].append({
             'step': step_count,
             'p2p_v': p2p_v,
             'profit': market_profit,
-            'co2': co2_step,
-            'grid_dep': market_data['rolling_grid_dependency']
+            'grid_dep': market_data['rolling_grid_dependency'],
+            'hour': sim_hour
         })
         if len(market_data['history']) > 50:
             market_data['history'].pop(0)
 
-        # 4. Save for Dashboard
-        with open(STATS_FILE, "w") as f:
+        # 7. Broadcast for Dashboard (Atomic write simulation)
+        tmp_file = STATS_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
             json.dump(market_data, f, indent=2)
+        os.replace(tmp_file, STATS_FILE)
 
-        print(f"[{market_data['last_update']}] Step {step_count} | Vol: {p2p_v:.2f} | Mkt_Profit: {market_profit:.2f} | Success: {info.get('match_info',{}).get('total_volume',0)>0}")
+        print(f"[{market_data['last_update']}] Step {step_count} (Hour {sim_hour:02d}:00)")
         
         if done or truncated:
-            print("Resetting Episode...")
             obs, _ = env.reset()
             
-        time.sleep(1) # Real-time simulation delay
+        time.sleep(1.5) # Optimized for high-level readability
 
 if __name__ == "__main__":
-    run_real_time()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="hybrid", choices=["hybrid", "ausgrid"])
+    args = parser.parse_args()
+    run_real_time(dataset=args.dataset)

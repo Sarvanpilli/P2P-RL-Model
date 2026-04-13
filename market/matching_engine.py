@@ -15,23 +15,24 @@ class MatchingEngine:
         self.grid_buy_price = float(grid_buy_price)   # Price to buy FROM grid (Retail)
         self.grid_sell_price = float(grid_sell_price) # Price to sell TO grid (Feed-in)
 
-    def match(self, bids, grid_buy_price: float = None, grid_sell_price: float = None):
+    def match(self, bids, grid_buy_price: float = None, grid_sell_price: float = None, 
+              epsilon: float = 0.12, margin: float = 0.0, progress: float = 1.0,
+              use_curriculum: bool = True):
         """
         Matches orders using a Uniform Price Double Auction.
-        
-        Args:
-            bids: np.array of shape (n_agents, 2).
-                  Column 0: Quantity (kW), positive=sell, negative=buy.
-                  Column 1: Price Limit ($/kWh).
-            grid_buy_price: Optional dynamic Retail Price (if None, use default)
-            grid_sell_price: Optional dynamic Feed-in Price (if None, use default)
-                  
-        Returns:
-            trades: np.array of shape (n_agents,), actual energy traded (kW)
-            clearing_price: float, market clearing price ($/kWh)
-            grid_flow: float, net flow with grid
-            info: dict
         """
+        # --- PHASE 13: SCIENTIFIC VALIDATION ABLATION ---
+        if not use_curriculum:
+            effective_epsilon = 0.10
+            effective_margin = 0.0
+        else:
+            # --- PHASE 12: MATCH EXPANSION ---
+            # During early training (progress < 0.3), we allow extremely loose matches
+            effective_epsilon = epsilon
+            effective_margin = margin
+            if progress < 0.3:
+                effective_epsilon += 0.1
+                effective_margin += 0.05
         # Resolve prices
         g_buy = float(grid_buy_price) if grid_buy_price is not None else self.grid_buy_price
         g_sell = float(grid_sell_price) if grid_sell_price is not None else self.grid_sell_price
@@ -44,36 +45,30 @@ class MatchingEngine:
         buyers_idx = np.where(quantities < -1e-6)[0]
         
         # Create Order Books
-        # Sell Orders: Sort by Price ASC (Cheapest first)
         sell_orders = []
         for idx in sellers_idx:
             sell_orders.append({'id': idx, 'qty': quantities[idx], 'price': prices[idx]})
         sell_orders.sort(key=lambda x: x['price'])
         
-        # Buy Orders: Sort by Price DESC (Highest willingness to pay first)
         buy_orders = []
         for idx in buyers_idx:
             buy_orders.append({'id': idx, 'qty': abs(quantities[idx]), 'price': prices[idx]})
         buy_orders.sort(key=lambda x: x['price'], reverse=True)
         
         # --- FLEXIBLE MID-PRICE AUCTION LOGIC ---
-        # 1. Separate Buyers and Sellers
         current_sell_orders = [s.copy() for s in sell_orders]
         current_buy_orders = [b.copy() for b in buy_orders]
         
-        # 2. Match Pairs based on Spread (Greedy Volume Maximization)
-        # PRIORITIZING TIGHTEST SPREADS FIRST (Scientific Request)
-        # Updated to 0.10 for Advanced Performance Scaling
-        EPSILON = 0.10
-        # To do this correctly, we find all possible valid pairs (spread >= -EPSILON)
-        # and sort them so that the most "competitive" (marginal) trades go first.
+        # Match Pairs based on Spread (Greedy Volume Maximization)
+        # PRIORITIZING TIGHTEST SPREADS FIRST
+        # Epsilon and Margin are now dynamic parameters from Step 1/2 of curriculum.
         
         possible_pairs = []
         for b in current_buy_orders:
             for s in current_sell_orders:
                 spread = b['price'] - s['price']
-                if spread >= -EPSILON:
-                    # Sort criteria: smallest positive spread first, then closest to zero negative spread (epsilon slack)
+                # Soft matching margin applied (Phase 12 effective relaxation)
+                if spread >= -(effective_epsilon + effective_margin):
                     possible_pairs.append({
                         'b_idx': b['id'],
                         's_idx': s['id'],
@@ -97,8 +92,9 @@ class MatchingEngine:
                 qty = min(buyer['qty'], seller['qty'])
                 potential_price = (buyer['price'] + seller['price']) / 2.0
                 
-                # Economic feasibility check
-                if potential_price <= buyer['price'] + 1e-9 and potential_price >= seller['price'] - 1e-9:
+                # PHASE 12: STRICT PRICE VALIDATION (RELAXED DURING CURRICULUM)
+                # seller_min_price - margin <= clearing_price <= buyer_max_price + margin
+                if potential_price <= buyer['price'] + effective_margin + 1e-9 and potential_price >= seller['price'] - effective_margin - 1e-9:
                     trades[seller['id']] += qty
                     trades[buyer['id']] -= qty
                     matched_volume += qty

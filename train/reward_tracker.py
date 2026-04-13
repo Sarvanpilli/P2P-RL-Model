@@ -28,6 +28,8 @@ class RewardTracker:
         self.step_smoothing_penalty = np.zeros(self.n_agents)
         self.step_co2_penalty = np.zeros(self.n_agents)
         self.step_p2p_bonus = np.zeros(self.n_agents)
+        self.step_alignment_reward = np.zeros(self.n_agents)
+        self.step_participation_penalty = np.zeros(self.n_agents)
         self.step_fairness_penalty = 0.0
         
         # Cumulative stats (optional, usually handled by wrapper/logger)
@@ -73,13 +75,23 @@ class RewardTracker:
                              p2p_bonuses: np.ndarray = None,
                              total_export_kw: float = 0.0,
                              traded_energy: np.ndarray = None,
-                             trade_intent: np.ndarray = None) -> float:
+                             trade_intent: np.ndarray = None,
+                             alpha: float = 0.05,
+                             beta: float = 1.0,
+                             lambda_align: float = 0.0,
+                             avg_market_price: float = 0.15,
+                             bids: np.ndarray = None,
+                             use_alignment_reward: bool = True) -> float:
         """
         Aggregates the core components into a scalar reward.
         Includes Phase 5+ upgrades: Trade Success and Diversity Regularization.
+        
+        Args:
+            alpha: Dynamic reward coefficient for trade success (Step 3 Curriculum).
         """
         
         # 1. Update internal state with Clipping
+        # ... (rest of logic)
         self.step_profit = profits
         self.step_grid_penalty = np.clip(grid_import_penalties, 0.0, 50.0) 
         self.step_soc_penalty = np.clip(soc_penalties, 0.0, 10.0)
@@ -96,16 +108,35 @@ class RewardTracker:
         self.step_co2_penalty = np.clip(co2_penalties, 0.0, 20.0)
         self.step_p2p_bonus = p2p_bonuses
         
-        # --- NEW COMPONENTS (Phase 5 Upgrade) ---
         # 3g. Trade Success Reward (alpha * traded_energy)
-        # alpha <= 0.5 * average_profit_per_kwh (~0.05)
-        ALPHA = 0.05
-        self.step_trade_reward = traded_energy * ALPHA
+        self.step_trade_reward = traded_energy * alpha
+        
+        # --- PHASE 13: SCIENTIFIC VALIDATION ABLATIONS ---
+        if use_alignment_reward and bids is not None:
+             # bids = n_agents x 4 (qty, price, agent_id, role)
+             # Extract prices for coordination
+             agent_prices = bids[:, 1]
+             # exp(-abs(bid - avg))
+             alignment_signals = np.exp(-np.abs(agent_prices - avg_market_price))
+             self.step_alignment_reward = alignment_signals * lambda_align
+        else:
+             self.step_alignment_reward = np.zeros(self.n_agents)
+
+        # 3i. Participation Penalty
+        if trade_intent is not None:
+             self.step_participation_penalty = np.where(np.abs(trade_intent) < 0.05, -0.01, 0.0)
+        else:
+             self.step_participation_penalty = np.zeros(self.n_agents)
+             
+        # grid_penalty now uses BETA
+        self.step_grid_penalty = np.clip(grid_import_penalties * beta, 0.0, 50.0)
         
         # 2. Compute per-agent net value (before global penalties)
         per_agent_net = (self.step_profit 
                          + self.step_p2p_bonus
                          + self.step_trade_reward
+                         + self.step_alignment_reward
+                         + self.step_participation_penalty
                          - self.step_grid_penalty 
                          - self.step_soc_penalty 
                          - self.step_grid_overload_penalty 
@@ -167,6 +198,29 @@ class RewardTracker:
 
 
 
+    def calculate_scientific_metrics(self, battery_degradation_rate: float = 0.01, co2_intensity: float = 0.4):
+        """
+        Computes scientific metrics for Phase 13 validation.
+        """
+        clean_profits = self.step_profit
+        # Note: step_battery_quantities is what we want for degradation calculation
+        # If it's not explicitly tracked, we use step_battery_cost as a proxy or track it in env.
+        # For Phase 13, let's assume battery_costs already includes some factor, 
+        # but the request asks for a separate metric.
+        
+        # We need to ensure step_grid_import_quantities exists
+        grid_import_q = getattr(self, "step_grid_import_quantities", np.zeros(self.n_agents))
+        battery_q = getattr(self, "step_battery_quantities", np.zeros(self.n_agents))
+        
+        economic_profits = clean_profits - (battery_q * battery_degradation_rate)
+        carbon_emissions = grid_import_q * co2_intensity
+        
+        return {
+            "clean_profits": clean_profits,
+            "economic_profits": economic_profits,
+            "carbon_emissions": carbon_emissions
+        }
+
     def get_info(self) -> Dict[str, Any]:
         """Returns dict of current step stats for logging."""
         return {
@@ -178,5 +232,7 @@ class RewardTracker:
             "mean_smoothing_penalty": np.mean(self.step_smoothing_penalty),
             "mean_co2_penalty": np.mean(self.step_co2_penalty),
             "mean_p2p_bonus": np.mean(self.step_p2p_bonus),
+            "mean_alignment_reward": np.mean(self.step_alignment_reward),
+            "mean_participation_penalty": np.mean(self.step_participation_penalty),
             "fairness_penalty": self.step_fairness_penalty
         }
