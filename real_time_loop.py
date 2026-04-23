@@ -15,7 +15,7 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from train.energy_env_robust import EnergyMarketEnvRobust
 
 STATS_FILE = "live_market_stats.json"
-MODEL_PATH = "models_scalable_v5/ppo_n16_v5.zip"
+MODEL_PATH = "models_scalable_v5/ppo_n24_v5.zip"
 
 
 
@@ -37,7 +37,7 @@ def run_real_time(dataset="hybrid"):
     def init_simulation(ds_name):
         target_data = data_map.get(ds_name, "processed_hybrid_data.csv")
         new_env = EnergyMarketEnvRobust(
-            n_prosumers=4, 
+            n_prosumers=24, 
             n_consumers=0, 
             data_file=target_data,
             random_start_day=True,

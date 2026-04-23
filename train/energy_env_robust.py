@@ -96,8 +96,12 @@ class EnergyMarketEnvRobust(gym.Env):
         self.total_economic_profit = 0.0   # PHASE 13
         self.total_carbon_emissions = 0.0  # PHASE 13
         self.total_demand_all = 1e-6
+        self.total_baseline_import = 1e-6 # NEW
+        self.total_trade_attempts = 1e-6  # NEW
         self.rolling_grid_dep_buffer = deque([1.0]*24, maxlen=24)
         self.rolling_grid_dependency = 1.0
+        # --- SLIM v6: Average Demand for Normalization ---
+        self.avg_demand_buffer = np.full((self.n_agents, 24), 0.5) # Initialize with 0.5kW default
 
         self.matching_engine = MatchingEngine(grid_buy_price=0.20, grid_sell_price=0.10)
         self.timestep_hours = 1.0
@@ -222,9 +226,13 @@ class EnergyMarketEnvRobust(gym.Env):
         self.total_grid_export = 0.0
         self.total_p2p_volume = 0.0
         self.total_demand_all = 1e-6
+        self.total_baseline_import = 1e-6 # NEW
+        self.total_trade_attempts = 1e-6  # NEW
         
         # --- NEW: Rolling Dependency Tracker (24-step) ---
         self.rolling_grid_dependency = 1.0
+        # --- SLIM v6: Average Demand for Normalization ---
+        self.avg_demand_buffer = np.full((self.n_agents, 24), 0.5) # Initialize with 0.5kW default
 
         self.prev_market_price = 0.15 # Step 2/4 Persistence
         self.rng = np.random.default_rng(seed=42)
@@ -341,6 +349,17 @@ class EnergyMarketEnvRobust(gym.Env):
             start_soc = self.rng.uniform(0.2, 0.8) * node.battery_capacity_kwh
             node.reset(soc=start_soc)
             
+        # --- SLIM v7: Reset Cumulative Counters ---
+        self.total_grid_import = 0.0
+        self.total_grid_export = 0.0
+        self.total_p2p_volume = 0.0
+        self.total_clean_profit = 0.0
+        self.total_economic_profit = 0.0
+        self.total_demand_all = 1e-6
+        self.total_baseline_import = 1e-6
+        self.total_trade_attempts = 1e-6
+        self.rolling_grid_dependency = 1.0
+            
         # Reset History
         self.history_buffer['demand'].fill(0.0)
         self.history_buffer['pv'].fill(0.0)
@@ -455,10 +474,9 @@ class EnergyMarketEnvRobust(gym.Env):
         cur_params = self._get_curriculum_params()
         progress = cur_params['progress']
         
-        if cur_params['noise_std'] > 1e-6:
-            noise = self.rng.normal(0, cur_params['noise_std'], size=(self.n_agents, 3))
-            raw_action[:, 1:] += noise[:, 1:]
-            raw_action = np.clip(raw_action, -1.0, 1.0)
+        # --- Emergence: Forced Gaussian Noise ---
+        noise = self.rng.normal(0, 0.05, size=raw_action.shape)
+        raw_action = np.clip(raw_action + noise, -1.0, 1.0)
             
         # --- PHASE 10: ACTION MASKING (Consumers) ---
         for i in range(self.n_agents):
@@ -467,7 +485,7 @@ class EnergyMarketEnvRobust(gym.Env):
                 raw_action[i, 1] = np.clip(raw_action[i, 1], -1.0, 0.0)
         
         # Deadlock Breaking
-        if self.market_history['steps_without_trade'] >= 12:
+        if self.market_history['steps_without_trade'] >= 12 and np.sum(np.abs(raw_action[:, 1])) > 1e-4:
             noise = self.rng.normal(0, 0.05, size=raw_action.shape)
             raw_action = np.clip(raw_action + noise, -1.0, 1.0)
             
@@ -529,7 +547,7 @@ class EnergyMarketEnvRobust(gym.Env):
             'guard_info': guard_info
         }
 
-    def _step_market(self, safe_action, epsilon=0.12, margin=0.0, progress=1.0):
+    def _step_market(self, safe_action, epsilon=0.20, margin=0.0, progress=1.0):
         grid_req = safe_action[:, 1]
         price_bid = safe_action[:, 2]
         
@@ -572,49 +590,33 @@ class EnergyMarketEnvRobust(gym.Env):
         # Let's assume standard 'matching_engine.match()' does Quantity matching.
         # We will wrap it with Price Check.
         
-        # --- STEP 4: COMPLETE PRICE SMOOTHING ---
+        # --- STEP 2: DYNAMIC PRICING & RATIONAL BIDDING ---
         total_market_demand = np.sum(np.abs(trade_intents[trade_intents < 0]))
         total_market_supply = np.sum(np.abs(trade_intents[trade_intents > 0]))
         
-        base_p = 0.10
-        k1 = 0.05
-        eps = 1e-4
-        price_raw = base_p + k1 * (total_market_demand / (total_market_supply + eps))
-        
-        # Temporal Smoothing (0.7 / 0.3)
-        dynamic_price = 0.7 * self.prev_market_price + 0.3 * price_raw
-        
-        # Adaptive Correction
-        if self.rolling_grid_dependency > 0.9:
-            dynamic_price *= 0.9
-            
-        # Clamp and Persist
-        dynamic_price = np.clip(dynamic_price, 0.05, 0.30)
-        self.prev_market_price = dynamic_price
-        
         retail_p, feed_in_p = self._get_grid_prices()
         
-        # Selling Constraint: Don't undercut 80% of grid Feed-In Tariff (Viability Floor)
-        # This prevents "toxic trades" where P2P price < 0.8 * Grid Sale price
-        SELLER_FLOOR = 0.8 * feed_in_p
+        # Formula: price = base_price + k1 * (demand / (supply + 1e-6))
+        base_p = 0.10
+        k1 = 0.05
+        # Ensure P2P is always cheaper than grid (0.95 * retail)
+        price_raw = base_p + k1 * (total_market_demand / (total_market_supply + 1e-6))
+        dynamic_price = np.clip(price_raw, feed_in_p, 0.95 * retail_p)
+        self.prev_market_price = dynamic_price
         
-        # STEP 2: STABILIZE CONSUMER BID FORMULATION
         real_limit_prices = np.zeros(self.n_agents)
         for i in range(self.n_agents):
             node = self.nodes[i]
-            # Use raw action for 'bid perception' if prosumer, or special formula for consumer
-            action_val = bid_prices[i] # Bounded [0, 1]
+            action_val = bid_prices[i] # Bounded [0, 1] perception
             
-            if node.is_prosumer > 0.5: # Prosumer
-                if trade_intents[i] > 0: # Seller
-                    real_limit_prices[i] = max(dynamic_price, SELLER_FLOOR)
-                else: # Buyer
-                    real_limit_prices[i] = dynamic_price
-            else: # Consumer
-                # Rule-based bounded bid (Step 2)
-                # sensitivity [0.8, 1.2] applied to a bounded action range
-                bid = dynamic_price * (0.8 + 0.4 * action_val) * node.price_sensitivity
-                real_limit_prices[i] = np.clip(bid, 0.05, 0.30)
+            if trade_intents[i] > 1e-6: # Seller
+                # Enforce: seller_min_price >= feed_in_tariff (Step 2)
+                real_limit_prices[i] = feed_in_p + action_val * (dynamic_price - feed_in_p)
+            elif trade_intents[i] < -1e-6: # Buyer
+                # Enforce: buyer_max_price <= grid_price (Step 2)
+                real_limit_prices[i] = dynamic_price + action_val * (retail_p - dynamic_price)
+            else:
+                real_limit_prices[i] = dynamic_price
         
         # Pass trades to Matching Engine
         bids_input = np.stack([trade_intents, real_limit_prices], axis=1)
@@ -674,290 +676,130 @@ class EnergyMarketEnvRobust(gym.Env):
         safe_action = physics_state['safe_action']
         retail_p, feed_in_p = self._get_grid_prices()
         
-        # --- PHASE 12: DYNAMIC INCENTIVES ---
-        beta = cur_params['beta']
-        alpha = cur_params['alpha']
-        lambda_align = cur_params['lambda_align']
-        avg_market_price = self.market_history['last_market_price']
+        # --- SLIM v7: Reward Parameters ---
+        beta = cur_params.get('beta', 2.5) # Forced stable to 2.5 according to user
+        alpha = cur_params.get('alpha', 0.035)
+        gamma = cur_params.get('gamma', 0.02)
+        lambda_align = cur_params.get('lambda_align', 0.04)
         
-        # Calculate Coordination Alignment Reward
-        # alignment = exp(-abs(bid - avg_market_price))
-        # Use bids_processed which has the real limits
-        bids = market_results['bid_prices']
-        alignment_penalty = np.exp(-np.abs(bids - avg_market_price))
-        alignment_reward = alignment_penalty * lambda_align
-
-        # 1. Economic Coefficients (Unified with Phase 12 Curriculum)
-        # beta and alpha are used directly below.
-        SMOOTHING_COEFF = 0.02 
-        CO2_PENAL_COEFF = 0.15 
+        # 1. Update Average Demand for Normalization
+        current_demands = np.array(physics_state['demands'])
+        self.avg_demand_buffer = np.roll(self.avg_demand_buffer, -1, axis=1)
+        self.avg_demand_buffer[:, -1] = current_demands
+        avg_demands = np.mean(self.avg_demand_buffer, axis=1)
         
         # 2. Grid & P2P Analysis
-        # Ground Truth: Each agent's net physical requirement
-        # node_results is a list of dicts from MicrogridNode.step()
         phys_net_load = np.array([res['net_load_kw'] for res in node_results])
-        
-        # P2P matched volume comes from the matching engine (cleared between agents)
-        # We need to extract the P2P portion of the trades.
-        # market_results['match_info']['total_volume'] is the aggregate P2P volume.
         total_p2p_volume = market_results.get('match_info', {}).get('total_volume', 0.0)
         
-        # Determine each agent's p2p_trade (part of their net_load satisfied by P2P)
-        # In a pro-rata uniform auction, we can derive this from market_results['trades']
-        # which already contains [P2P + Bidded_Grid].
-        # But it's safer to just allocate total_p2p_volume based on the matching engine's logic.
-        
+        # P2P matched volume per agent
         p2p_agent_trades = np.zeros(self.n_agents)
-        # trades_market = market_results['trades'] # This only includes bidded volume
-        
-        # For simplicity and correctness: 
-        # Actual Grid Trade = Physical_Net_Load - (successful P2P trades)
-        # We'll use the matching engine's P2P volume to ensure consistency
-        
-        # Identify who actually traded P2P (those who bid and were matched)
-        # The matching engine 'trades' result includes both P2P and Grid-as-Backstop.
-        # total_export_bidded = sum of positive market trades
-        # total_import_bidded = sum of absolute negative market trades
-        total_exp_b = np.sum(np.clip(trades, 0, None))
-        total_imp_b = np.sum(np.abs(np.clip(trades, None, 0)))
+        total_exp_b = np.sum(np.clip(trades, 1e-6, None))
+        total_imp_b = np.sum(np.abs(np.clip(trades, None, -1e-6)))
         
         for i in range(self.n_agents):
-            if trades[i] > 0: # Seller in market
-                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_exp_b if total_exp_b > 0 else 0)
-            else: # Buyer in market
-                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_imp_b if total_imp_b > 0 else 0)
+            if trades[i] > 1e-6:
+                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_exp_b if total_exp_b > 1e-6 else 0)
+            elif trades[i] < -1e-6:
+                p2p_agent_trades[i] = trades[i] * (total_p2p_volume / total_imp_b if total_imp_b > 1e-6 else 0)
         
-        # The ACTUAL energy exchange with the grid for agent i is:
-        # grid_trade[i] = physical_net_load[i] - p2p_agent_trades[i]
-        # BUT wait: net_load is (Dem - PV + Batt). P2P trade is positive for sell, negative for buy.
-        # If net_load is -1.0 (surplus) and p2p_trade is 0.2 (sell), grid_export = 0.8.
-        # If net_load is 1.0 (deficit) and p2p_trade is -0.3 (buy), grid_import = 0.7.
-        # Formula: actual_grid_flow[i] = -phys_net_load[i] + p2p_agent_trades[i] 
-        # (Using Matching Engine sign convention: + is export, - is import)
-        
-        actual_grid_flow = -phys_net_load + p2p_agent_trades
-        
-        total_export = np.sum(np.clip(actual_grid_flow, 0, None))
+        # Actual Grid Flow
+        actual_grid_flow = -phys_net_load - p2p_agent_trades
         total_import = np.sum(np.abs(np.clip(actual_grid_flow, None, 0)))
+        # --- SLIM v7: Grid Savings (Clamped >= 0) ---
+        # User Spec: total_baseline = sum(max(0, demand_i - pv_i))
+        agent_demands = np.array(physics_state['demands'])
+        agent_pv = np.array(physics_state['pvs'])
+        agent_baselines = np.maximum(0.0, agent_demands - agent_pv)
+        total_baseline = np.sum(agent_baselines)
         
-        # Update metrics for info
+        # grid_saved = baseline - actual_import
+        global_grid_saved = max(0.0, total_baseline - total_import)
+        
+        # local_grid_saved_i = baseline_i - actual_import_i
+        actual_import_i = np.abs(np.clip(actual_grid_flow, None, 0))
+        local_grid_saved = np.maximum(0.0, agent_baselines - actual_import_i)        # Metrics Tracking
         self.total_grid_import += total_import
-        self.total_grid_export += total_export
         self.total_p2p_volume += total_p2p_volume
+        self.total_baseline_import += total_baseline # NEW
+        self.total_demand_all += np.sum(agent_demands) # NEW
 
         # 3. Component Calculations
-        # 3a. Grid Import Penalty
-        grid_import_kw = np.maximum(0.0, -actual_grid_flow)
-        grid_import_penalty = grid_import_kw * beta
+        p2p_revenue = np.clip(p2p_agent_trades, 0, None) * market_price
+        p2p_cost = np.abs(np.clip(p2p_agent_trades, None, 0)) * market_price
+        grid_cost = np.abs(np.clip(actual_grid_flow, None, 0)) * retail_p
         
-        # 3b. Action Smoothing Penalty
-        # Applied to all 3 action components for stability
-        action_diffs = np.abs(safe_action - self.prev_actions)
-        smoothing_penalty = np.sum(action_diffs, axis=1) * SMOOTHING_COEFF
-        
-        # 3c. CO2 Penalty (based on grid import)
-        # kg_co2 = grid_import_kwh * co2_intensity
-        grid_import_kwh = grid_import_kw * self.timestep_hours
-        co2_penalty = (grid_import_kwh * co2) * CO2_PENAL_COEFF
-        
-        # 3d. P2P Trading Bonus (+alpha per kWh)
-        p2p_bonus = np.abs(p2p_agent_trades) * alpha
-        
-        # 3e. Overload Penalties
-        line_overload_kw = max(0.0, max(total_export, total_import) - self.max_line_capacity_kw)
-        overload_penalty_agent = np.ones(self.n_agents) * line_overload_kw * self.overload_multiplier / self.n_agents
-        
-        # 3f. Operational Penalties (SoC and Battery Wear)
-        socs_final = np.array([r['soc'] for r in node_results])
         throughputs = np.array([r['throughput_delta'] for r in node_results])
+        action_diffs = np.abs(safe_action - self.prev_actions)
+        smoothing_penalty = np.sum(action_diffs, axis=1) * 0.02
+        grid_import_kwh = np.abs(np.clip(actual_grid_flow, None, 0)) * self.timestep_hours
+        co2_penalty = (grid_import_kwh * (co2 if isinstance(co2, float) else 0.4)) * 0.15
+        socs_final = np.array([r['soc'] for r in node_results])
         soc_penalty = (socs_final - 50.0)**2 * 0.001
-        battery_wear_cost = throughputs * 0.02  # PHASE 14: reduced to allow arbitrage cycles
         
-        # 3g. PHASE 14: 3-Layer ToU Battery Arbitrage Strategy
-        hour = (self.current_idx % 24)
-        is_solar_harvest = (6 <= hour < 16)
-        is_prepeak       = (14 <= hour < 17)
-        is_peak          = (17 <= hour < 21)
-        batt_reward = np.zeros(self.n_agents)
+        trade_intents = market_results.get('trade_intents', np.zeros(self.n_agents))        # Success Metric
+        total_p2p_attempts = np.sum(np.abs(trade_intents))
+        self.total_trade_attempts += total_p2p_attempts # NEW
+        success_rate = total_p2p_volume / (total_p2p_attempts + 1e-6) if total_p2p_attempts > 1e-6 else 0.0
+        self.market_history['last_success_rate'] = success_rate
         
-        # 1-step solar lookahead
-        next_gen = 0.0
-        if self.df is not None:
-            next_row = self.df.iloc[(self.current_idx + 1) % len(self.df)]
-            next_gen = next_row.get('agent_0_pv_kw', 0.0)
+        grid_reduction_percent = global_grid_saved / (total_baseline + 1e-6)
         
-        retail_p_local, _ = self._get_grid_prices()
-        trade_intents = market_results.get('trade_intents', np.zeros(self.n_agents))
+        # 4. Final Aggregation (v7 spec)
+        # --- SLIM Emergence: Trade Discovery ---
+        agent_surplus = agent_pv > (agent_demands + 1e-3)
+        agent_deficit = agent_demands > (agent_pv + 1e-3)
+        trade_possible = bool(np.any(agent_surplus) and np.any(agent_deficit))
         
-        for i in range(self.n_agents):
-            soc_i   = socs_final[i]        # [0, 100] %
-            pv_i    = physics_state['pvs'][i]
-            dem_i   = physics_state['demands'][i]
-            act_batt = safe_action[i, 0]   # > 0 = charge, < 0 = discharge
-            net_node = pv_i - dem_i
-            
-            # ── Layer 1: Solar Harvest (6h–16h) ─────────────────────────
-            # Charge from surplus PV while battery has headroom
-            if is_solar_harvest and soc_i < 80.0 and (net_node > 0 or next_gen > 0.5) and act_batt > 0.05:
-                batt_reward[i] += 0.06
-            
-            # ── Layer 2: Pre-Peak Top-Up (14h–17h) ──────────────────────
-            # Ensure battery is well-charged before the expensive peak window
-            if is_prepeak and soc_i < 60.0 and act_batt > 0.05:
-                batt_reward[i] += 0.04
-            
-            # ── Layer 3: Peak Dispatch (17h–21h) ────────────────────────
-            if is_peak:
-                if soc_i > 20.0 and act_batt < -0.05:
-                    # Reward discharging to avoid retail grid cost
-                    batt_reward[i] += 0.10
-                if soc_i > 20.0 and trade_intents[i] < -1e-6 and market_results.get('market_price', 0) > retail_p_local:
-                    # Penalise importing from expensive grid when battery has reserves
-                    batt_reward[i] -= 0.08
-            
-            # ── Buyer Rationality (unchanged) ───────────────────────────
-            if trade_intents[i] < -1e-6 and market_results.get('market_price', 0.) > retail_p_local:
-                batt_reward[i] -= 0.05 
-        
-        # 4. Final Aggregation
-        raw_market_profits = trades * market_price
-        
-        # --- NEW: FUTURE-AWARE REWARD (Multi-Step Step 6) ---
-        GAMMA_FUTURE = 0.05
-        # prev_actions storage reused for profit? No, let's just use current.
-        # But user suggestedgamma * expected_future_profit. 
-        # For simplicity in 1-step MDP, we use a small reward persistence.
-        
-        # --- PHASE 13: SCIENTIFIC VALIDATION ---
-        # Track quantities for scientific metrics
-        self.reward_tracker.step_grid_import_quantities = grid_import_kw * self.timestep_hours
-        self.reward_tracker.step_battery_quantities = throughputs * self.timestep_hours
-        
+        # Battery Usage Detection
+        battery_throughputs = np.array([res['throughput_delta'] for res in node_results])
+        battery_used_step = bool(np.sum(battery_throughputs) > 1e-3)
+
         reward = self.reward_tracker.calculate_total_reward(
-            profits=raw_market_profits,
-            grid_import_penalties=grid_import_penalty,
-            soc_penalties=soc_penalty,
-            grid_overload_costs=overload_penalty_agent,
-            battery_costs=battery_wear_cost + battery_wear_cost - batt_reward,
-            smoothing_penalties=smoothing_penalty,
-            co2_penalties=co2_penalty,
-            p2p_bonuses=p2p_bonus,
-            total_export_kw=total_export,
+            p2p_revenue=p2p_revenue,
+            p2p_cost=p2p_cost,
+            grid_cost=grid_cost,
             traded_energy=np.abs(p2p_agent_trades),
-            trade_intent=safe_action[:, 1],
-            alpha=alpha,
-            beta=beta,
-            lambda_align=lambda_align,
-            avg_market_price=avg_market_price,
-            bids=np.stack([safe_action[:, 1], safe_action[:, 2]], axis=1), # [qty, price]
-            use_alignment_reward=self.use_alignment_reward
+            avg_demand=avg_demands,
+            battery_throughput=battery_throughputs,
+            trade_matched=np.abs(p2p_agent_trades),
+            trade_possible=trade_possible,
+            battery_used_step=battery_used_step
         )
         
-        # Calculate Phase 13 Metrics
-        sci_metrics = self.reward_tracker.calculate_scientific_metrics(
-            battery_degradation_rate=0.01, 
-            co2_intensity=co2 if isinstance(co2, (float, int)) else 0.4
-        )
-        
-        self.total_clean_profit += np.sum(sci_metrics["clean_profits"])
-        self.total_economic_profit += np.sum(sci_metrics["economic_profits"])
-        self.total_carbon_emissions += np.sum(sci_metrics["carbon_emissions"])
-        
-        # --- UPDATE ROLLING DEPENDENCY (Step 1) ---
-        # Add a floor to demands to prevent infinite dependency (%) at scale
-        total_net_demand = np.sum(physics_state['demands'])
-        if total_net_demand > 0.1:
-            # Cap at 1.0 (100%) to ensure it remains a valid 'dependency' metric even during battery charging
-            current_dep = min(1.0, float(total_import / total_net_demand))
-        else:
-            current_dep = 0.0 
-            
-        self.rolling_grid_dep_buffer.append(current_dep)
-        self.rolling_grid_dependency = np.mean(self.rolling_grid_dep_buffer)
-        
-        # --- LAGRANGIAN SAFETY PENALTY ---
-        # Get current SoC values for all agents
+        # Lagrangian (Safety)
         current_socs = np.array([node.soc for node in self.nodes])
         battery_caps = np.array([node.battery_capacity_kwh for node in self.nodes])
-
-        # Total absolute network flow
-        total_abs_flow_kw = max(total_export, total_import)
-        
+        total_abs_flow_kw = max(total_import, np.sum(np.clip(actual_grid_flow, 0, None)))
         lagrangian_violations = self.lagrangian.compute_violations(
-            soc_values=current_socs,
-            battery_capacities=battery_caps,
-            line_flow_kw=total_abs_flow_kw,
-            max_line_capacity_kw=self.max_line_capacity_kw,
-            grid_voltage_kv=getattr(self, 'grid_voltage_kv', 0.4),
-            line_resistance_ohm=getattr(self, 'line_resistance_ohms', 0.01),
+            soc_values=current_socs, battery_capacities=battery_caps,
+            line_flow_kw=total_abs_flow_kw, max_line_capacity_kw=self.max_line_capacity_kw
         )
         lagrangian_penalty = self.lagrangian.compute_penalty(lagrangian_violations)
         self.lagrangian.record_step(lagrangian_violations)
-
-        # Subtract Lagrangian penalty from total reward (Reduced weight)
-        reward = reward - 0.5 * lagrangian_penalty
-
-        # Add to info dict for TensorBoard logging (will be updated below)
-        # --- END LAGRANGIAN ---
-        
-        # 5. Logging and Info Update
-        profit_breakdown = self.reward_tracker.get_profit_breakdown()
-        
-        # --- SCIENTIFIC METRIC BIFURCATION (Fixed for Demo) ---
-        market_price = market_results.get('market_price', 0.15)
-        # Market Profit = Savings per kWh traded locally vs Grid
-        retail_p = 0.20
-        market_profit_usd = float(total_p2p_volume * (retail_p - market_price))
-        
-        # 2. Economic Profit: Community Savings - Battery Depreciation
-        total_battery_wear = np.sum(battery_wear_cost)
-        economic_profit_usd = float(market_profit_usd - total_battery_wear)
-        
-        # 3. Consumption tracking
-        total_demand_kw = float(np.sum(physics_state['demands']))
+        reward -= 0.5 * lagrangian_penalty
 
         self.prev_actions = safe_action.copy()
         r_info = self.reward_tracker.get_info()
         
         info = {
-            "market_price": market_price,
-            "total_export": total_export,
-            "total_import": total_import,
-            "grid_capacity_limit": self.max_line_capacity_kw,
-            "line_overload_kw": line_overload_kw,
-            "p2p_volume_kwh_step": total_p2p_volume * self.timestep_hours,
-            "total_demand_kw": float(total_demand_kw),
-            "grid_import_kwh": float(np.sum(grid_import_kwh)),
-            "carbon_intensity": co2,
-            "clean_profit_usd": np.sum(sci_metrics["clean_profits"]),
-            "economic_profit_usd": np.sum(sci_metrics["economic_profits"]),
-            "carbon_emissions_kg": np.sum(sci_metrics["carbon_emissions"]),
-            "cum_clean_profit": self.total_clean_profit,
-            "cum_economic_profit": self.total_economic_profit,
-            "cum_carbon_emissions": self.total_carbon_emissions,
-            "trade_success_rate": self.market_history['last_success_rate'],
-            "grid_dependency": float(self.rolling_grid_dependency),
-            "p2p_volume": float(total_p2p_volume),
-            "liquidity": market_results.get('liquidity', 0.0),
-            "curriculum_epsilon": market_results.get('curriculum_epsilon', 0.15),
-            "curriculum_margin": market_results.get('curriculum_margin', 0.0),
-            "curriculum_beta": float(beta),
-            "success": market_results.get('success', 0.0),
-            "profit_breakdown": profit_breakdown,
-            **r_info,
-            **physics_state["guard_info"],
-            "market_profit_usd": market_profit_usd,
-            "failed_trades": market_results.get('failed_trades_count', 0),
-            
-            # Lagrangian Stats
-            **self.lagrangian.get_lambda_info(),
-            'lagrangian/violation_soc':     float(lagrangian_violations[0]),
-            'lagrangian/violation_line':    float(lagrangian_violations[1]),
-            'lagrangian/violation_voltage': float(lagrangian_violations[2]),
-            'lagrangian/penalty_this_step': lagrangian_penalty
+            'market_price': market_price,
+            'total_import': total_import,
+            'p2p_volume': total_p2p_volume,
+            'grid_reduction_percent': grid_reduction_percent,
+            'success_rate': success_rate,
+            'grid_dependency': float(self.rolling_grid_dependency),
+            'carbon_intensity': float(co2 if isinstance(co2, float) else 0.4),
+            'total_battery_usage': float(np.sum(battery_throughputs)),
+            'total_baseline_import': self.total_baseline_import, # NEW
+            'total_actual_import': self.total_grid_import,    # NEW
+            'total_trade_attempts_all': self.total_trade_attempts, # NEW
+            'total_p2p_volume_all': self.total_p2p_volume,      # NEW
+            'total_demand_all_scaled': self.total_demand_all,   # NEW
+            **r_info
         }
         
-        obs = self._get_obs(total_export, total_import)
+        obs = self._get_obs(total_abs_flow_kw, total_import) # Simplified total export call
         return obs, reward, info
 
     def _get_grid_prices(self):

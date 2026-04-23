@@ -13,12 +13,16 @@ STATS_FILE = "live_market_stats.json"
 CONFIG_FILE = "simulation_config.json"
 
 def load_data():
-    if os.path.exists(STATS_FILE):
-        with open(STATS_FILE, "r") as f:
-            try:
+    if not os.path.exists(STATS_FILE):
+        return None
+        
+    for _ in range(3): # Basic retry for Windows file contention
+        try:
+            with open(STATS_FILE, "r") as f:
                 return json.load(f)
-            except:
-                return None
+        except (IOError, PermissionError, json.JSONDecodeError):
+            time.sleep(0.1) # Wait briefly for simulation to release the file
+            continue
     return None
 
 def update_config(dataset):
@@ -64,7 +68,7 @@ while True:
             # --- HEADER ---
             col_h1, col_h2, col_h3 = st.columns([2, 1, 1])
             with col_h1:
-                st.title("⚡ SLIM v4: Smart P2P Market Monitor")
+                st.title("⚡ SLIM v4: Scaled P2P Market Monitor (N=24)")
             with col_h2:
                 # Simulation Clock (High Visibility)
                 st.metric("Simulation Time", f"{sim_hour:02d}:00", delta="Live Clock")

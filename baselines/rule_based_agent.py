@@ -90,15 +90,12 @@ class RuleBasedAgent:
             # Selling
             trade_kw = projected_net_gen # Positive
             # Strategy: Sell if price > Feed-in.
-            # Truthful bid: Marginal cost. Solar is free. Battery degradation is cost.
-            # Let's simple bid: Feed-in + epsilon (to prefer P2P over Grid)
-            price_bid = feed_in + 0.01 
+            price_bid = max(feed_in + 0.01, 0.05)
         else:
             # Buying
             trade_kw = projected_net_gen # Negative
             # Strategy: Buy if price < Retail.
-            # Truthful bid: Retail - epsilon (to prefer P2P over Grid)
-            price_bid = retail - 0.01
+            price_bid = min(retail - 0.01, 0.30)
             
         return np.array([batt_action, trade_kw, price_bid], dtype=np.float32)
 
